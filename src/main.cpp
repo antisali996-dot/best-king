@@ -379,6 +379,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
 static void Usage() {
     printf("best-king · 独立内存 dump 工具（Paradise 驱动专用, 硬闸门）\n");
     printf("用法: King.sh [--target pkg|pid] [--chunk N] <命令> ...\n");
+    printf("  无参数                              自动模式: 闸门 + dumpgame 一键（MT直接运行用这个）\n");
     printf("  selftest                            驱动连接自检（闸门流程单跑）\n");
     printf("  mods   [过滤]                        模块列表\n");
     printf("  maps   [过滤]                        maps 打印\n");
@@ -402,9 +403,24 @@ int main(int argc, char** argv) {
         }
         args.push_back(a);
     }
-    if (args.empty() || args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
+    if (!args.empty() && (args[0] == "help" || args[0] == "-h" || args[0] == "--help")) {
         Usage();
         return 0;
+    }
+
+    // MT管理器"运行"不带参数 → 自动模式: 自动获取王者进程 + 自动 dump（一键）
+    if (args.empty()) {
+        printf("[*] 自动模式: 自动获取「王者荣耀」进程 → 自动 dump（无需任何参数）\n");
+        const int g = Gatekeeper(target);
+        if (g != 0) {
+            printf("\n[X] 已阻断: par 驱动未连接或目标进程不可用, 主程序不启动（code=%d）\n", g);
+            return g;
+        }
+        printf("[*] 自动 dump → /data/adb/JAY/game.bin + game.idx（对局内执行效果最佳）\n\n");
+        const int rc = CmdDumpGame("/data/adb/JAY/game.bin", "/data/adb/JAY/game.idx");
+        printf("\n[完成] dumpgame rc=%d\n", rc);
+        if (rc == 0) printf("[完成] 把 /data/adb/JAY/game.bin 和 game.idx 发我即可\n");
+        return rc;
     }
 
     // ===== 硬闸门: 不通过则后面一行都不执行 =====
