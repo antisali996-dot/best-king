@@ -39,6 +39,20 @@ if exist "%PUSH%" (
     if errorlevel 1 ( echo [x] push failed & exit /b 1 )
     "%ADB%" shell "su -c 'chmod 777 /data/adb/JAY/King.sh'"
     echo [ok] pushed: /data/adb/JAY/King.sh
+
+rem ---- 推送设备侧脚本 (批量抓帧/一键快照) ----
+set "PUSH=%~dp0..\xiaogu-kernel\tools\jay_push.cmd"
+for %%F in (King_shot.sh King_snap.sh) do (
+    if exist "%PUSH%" (
+        call "%PUSH%" "%%F" "%%F"
+        if errorlevel 1 exit /b 1
+    ) else (
+        adb push "%%F" /data/local/tmp/%%F >nul
+        adb shell "su -c 'cp /data/local/tmp/%%F /data/adb/JAY/%%F && chmod 700 /data/adb/JAY/%%F'"
+        if errorlevel 1 ( echo [x] push %%F failed & exit /b 1 )
+    )
+    echo [ok] pushed: /data/adb/JAY/%%F
+)
 )
 
 echo.

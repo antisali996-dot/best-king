@@ -288,8 +288,9 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
     }
     struct Sel { uint64_t start, size; std::string name; };
     std::vector<Sel> sels;
-    const uint64_t LIMIT_TOTAL = 1500ull << 20;
-    const uint64_t LIMIT_ONE = 256ull << 20;
+    const uint64_t LIMIT_TOTAL = 6000ull << 20;
+    const uint64_t LIMIT_ONE = 2048ull << 20;
+    const uint64_t MIN_ONE  = 256ull << 10;   // 256KB
     uint64_t total = 0;
     int skipped = 0;
     for (size_t i = 0; i < maps.size(); ++i) {
@@ -300,7 +301,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
         if (!isBss && !inWin) continue;
         if (!r.path.empty() && r.path[0] != '[') continue;
         uint64_t sz = r.end - r.start;
-        if (sz < (1ull << 20)) continue;
+        if (sz < MIN_ONE) continue;
         if (total >= LIMIT_TOTAL) {
             skipped++;
             continue;
@@ -375,6 +376,618 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
     return 0;
 }
 
+// ================= HW 观察点扫描 (Plan B: 字段写入者定位) =================
+// 用法: hwbp_scan <hexObjAddr> <dur_ms> [wrw|w|x]
+// 一次在对象上挂 16 个硬件观察点, 覆盖 actor 已知 component 槽位族,
+// 采样 dur_ms 后按点位输出 PC/LR/寄存器现场 (用于离线锁 pos/hp 链)。
+static int CmdHwbpScan(uint64_t obj, uint32_t dur_ms, uint32_t mode) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+
+    static const uint64_t kOffs[] = {
+        0x130, 0x138, 0x140, 0x158, 0x170, 0x188, 0x1A0, 0x1B8,
+        0x200, 0x218, 0x230, 0x250, 0x268, 0x278, 0x280, 0x2C8
+    };
+    const size_t N = sizeof(kOffs) / sizeof(kOffs[0]);
+    std::vector<paradise_hwbp_point_config> pts(N);
+    for (size_t i = 0; i < N; ++i) {
+        pts[i].address = obj + kOffs[i];
+        pts[i].type = mode ? mode : PARADISE_HWBP_READ_WRITE;
+        pts[i].length = 8;
+        pts[i].scope = PARADISE_HWBP_ALL_THREADS;
+        pts[i].reserved = 0;
+    }
+    printf("[*] hwbp_scan: obj=0x%" PRIx64 " %dms mode=%u, 挂 16 点\n", obj, dur_ms, mode);
+    if (!g_drv->hwbp_set(pts.data(), N)) {
+        printf("[X] hwbp_set 失败 (驱动/内核不支持观察点)\n");
+        return 1;
+    }
+    auto sleep_ms = [](unsigned ms) { struct timespec ts{ms / 1000, (ms % 1000) * 1000000}; nanosleep(&ts, nullptr); };
+    uint32_t total_hits = 0;
+    for (uint32_t waited = 0; waited < dur_ms; waited += 200) {
+        sleep_ms(200);
+        uint32_t got = 0;
+        g_drv->hwbp_get_records(0, 0, nullptr, 0, &got);   // 探计数(容量0)
+        // 部分后端 capacity=0 无效: 改为直接读取头部记录
+        if (got == 0) {
+            static paradise_hwbp_record probe[4];
+            uint32_t n0 = 0;
+            if (g_drv->hwbp_get_records(0, 0, probe, 4, &n0)) {
+                got = n0;
+                if (n0 >= 4) got = 4;   // >=4 表示还在持续命中
+            }
+        }
+        total_hits = got;
+        if (got > 0) {
+            if (got >= 4) break;                       // 已有记录, 提前结束
+            break;
+        }
+    }
+    printf("[*] 采样完成, 读取现场 ...\n");
+    const uint32_t CAP = 16;
+    static paradise_hwbp_record recs[CAP];
+    for (size_t i = 0; i < N; ++i) {
+        uint32_t n = 0;
+        if (!g_drv->hwbp_get_records((uint32_t)i, 0, recs, CAP, &n)) continue;
+        if (n == 0) continue;
+        printf("---- point[%zu] +0x%" PRIx64 " %u hits ----\n", i, kOffs[i], (unsigned)n);
+        for (uint32_t r = 0; r < n && r < CAP; ++r) {
+            printf("  hit%u pc=0x%" PRIx64 " lr=0x%" PRIx64
+                   " x0=0x%" PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64
+                   " x8=0x%" PRIx64 " x19=0x%" PRIx64 " x20=0x%" PRIx64 "\n",
+                   r, recs[r].pc, recs[r].lr, recs[r].x0, recs[r].x1, recs[r].x2,
+                   recs[r].x8, recs[r].x19, recs[r].x20);
+        }
+    }
+    g_drv->hwbp_remove();
+    g_drv->hwbp_clear_records(-1);
+    printf(total_hits ? "[OK] hwbp_scan 完成 (有命中, 寄存器已抄录)\n"
+                      : "[!] %dms 内无命中 — 对象地址可能未激活/字段无人写\n", dur_ms);
+    return 0;
+}
+
+// ---------------- bpauto: 自动取根->L1->recarray->wrapper[0]->挂点 ----------------
+// 用法: bpauto <dur_ms> [mode]   (需在战斗中, 对象字段才有更新产生命中)
+static int CmdBpAuto(uint32_t dur_ms, uint32_t mode) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+
+    // [1] 定 libGameCore bss: 文件段最后一段末尾后的第一个 [anon:.bss]
+    std::vector<Region> maps = ReadMaps(g_pid);
+    uint64_t bss = 0;
+    for (size_t i = 0; i < maps.size(); ++i) {
+        if (maps[i].path.find("libGameCore.so") == std::string::npos) continue;
+        for (size_t j = i + 1; j < maps.size(); ++j) {
+            if (maps[j].path.find(".bss") != std::string::npos &&
+                maps[j].start >= maps[i].end) { bss = maps[j].start; break; }
+        }
+        if (bss) break;
+    }
+    if (!bss) { printf("[X] 未找到 libGameCore .bss\n"); return 1; }
+    printf("[*] bss = 0x%" PRIx64 "\n", bss);
+
+    // [2] bss 自证家族找 engine_root (root[0]==root, 最多扫 4MB)
+    uint64_t root = 0;
+    const size_t CHUNK = 0x40000;                       // 256KB, 不越 bss 边界
+    std::vector<uint8_t> blob(CHUNK);
+    for (uint64_t off = 0; off < (8ull << 20); off += CHUNK) {
+        if (!DrvReadAt(bss + off, blob.data(), CHUNK)) continue;
+        const uint64_t* U = reinterpret_cast<const uint64_t*>(blob.data());
+        for (size_t i = 0; i < CHUNK / 8; ++i) {
+            uint64_t v = U[i] & 0xFFFFFFFFFFFFull;
+            if (v < 0x7000000000ull) continue;
+            uint64_t w0 = 0;
+            if (!DrvReadAt(v, &w0, 8)) continue;
+            if ((w0 & 0xFFFFFFFFFFFFull) != v) continue;
+            // root+0x3D0 -> L1, 验证 L1+0x58/0x5C == 16/10
+            uint64_t l1v = 0;
+            if (!DrvReadAt(v + 0x3D0, &l1v, 8)) continue;
+            l1v &= 0xFFFFFFFFFFFFull;
+            uint32_t a = 0, b2 = 0, recv = 0;
+            if (DrvReadAt(l1v + 0x58, &a, 4) && a == 16 &&
+                DrvReadAt(l1v + 0x5C, &b2, 4) && b2 == 10) {
+                if (DrvReadAt(l1v + 0x40, &recv, 8)) {
+                    root = v; break;
+                }
+            }
+        }
+        if (root) break;
+    }
+    if (!root) { printf("[X] engine_root 自证未命中\n"); return 1; }
+    printf("[*] root = 0x%" PRIx64 "\n", root);
+
+    uint64_t l1 = 0; DrvReadAt(root + 0x3D0, &l1, 8); l1 &= 0xFFFFFFFFFFFFull;
+    printf("[*] L1 = 0x%" PRIx64 "\n", l1);
+    uint64_t rec = 0; DrvReadAt(l1 + 0x40, &rec, 8); rec &= 0xFFFFFFFFFFFFull;
+    printf("[*] recarray = 0x%" PRIx64 "\n", rec);
+
+    uint64_t wrap0 = 0;
+    for (int i = 0; i < 10; ++i) {
+        uint32_t p = 0;
+        if (!DrvReadAt(rec + 0x20ull * i + 0x08, &p, 4) || !p) continue;
+        wrap0 = (0x73ull << 32) | p;
+        break;
+    }
+    if (!wrap0) { printf("[X] wrapper[0] 为空 (未在对局内?)\n"); return 1; }
+    printf("[*] wrapper[0] = 0x%" PRIx64 "\n", wrap0);
+
+    // [3] 深探: 读 W+0x188 指针 -> P; 读得到则挂 P 的值字段并打印现值
+    uint64_t sv = 0;
+    if (DrvReadAt(wrap0 + 0x188, &sv, 8)) {
+        uint64_t P = sv & 0xFFFFFFFFFFFFull;
+        if (P >= 0x7000000000ull) {
+            printf("[*] W+0x188 -> P = 0x%" PRIx64 "\n", P);
+            uint8_t pb[16] = {0};
+            if (DrvReadAt(P + 0xA8, pb, 16)) {
+                uint32_t x = 0, z = 0;
+                memcpy(&x, pb, 4); memcpy(&z, pb + 8, 4);
+                printf("[*] P+0xA8..B7 = ");
+                for (int i = 0; i < 16; ++i) printf("%02x", pb[i]);
+                printf("  (int32@0=%d @8=%d → 米(%d,%d))\n", (int)x, (int)z, (int)x/100, (int)z/100);
+                if (x || z) {
+                    uint32_t mode2 = mode ? mode : PARADISE_HWBP_READ_WRITE;
+                    static const uint64_t kT[] = { 0xA8, 0xB0 };
+                    std::vector<paradise_hwbp_point_config> pts(2);
+                    for (size_t i = 0; i < 2; ++i) {
+                        pts[i].address = P + kT[i];
+                        pts[i].type = mode2;
+                        pts[i].length = 8;
+                        pts[i].scope = PARADISE_HWBP_ALL_THREADS;
+                        pts[i].reserved = 0;
+                    }
+                    printf("[*] 挂点 P+0xA8/P+0xB0, 采样 %ums\n", dur_ms);
+                    if (g_drv->hwbp_set(pts.data(), 2)) {
+                        struct timespec ts{dur_ms / 1000, (dur_ms % 1000) * 1000000};
+                        nanosleep(&ts, nullptr);
+                        static paradise_hwbp_record recs[8];
+                        for (size_t i = 0; i < 2; ++i) {
+                            uint32_t n = 0;
+                            if (!g_drv->hwbp_get_records((uint32_t)i, 0, recs, 8, &n)) continue;
+                            printf("---- P+0x%llx hits=%u ----\n", (unsigned long long)kT[i], (unsigned)n);
+                            for (uint32_t r = 0; r < n && r < 8; ++r)
+                                printf("  hit%u pc=0x%" PRIx64 " lr=0x%" PRIx64 " x0=0x%" PRIx64 " x1=0x%" PRIx64
+                                       " x2=0x%" PRIx64 " x8=0x%" PRIx64 " x19=0x%" PRIx64 " x20=0x%" PRIx64 "\n",
+                                       r, recs[r].pc, recs[r].lr, recs[r].x0, recs[r].x1, recs[r].x2,
+                                       recs[r].x8, recs[r].x19, recs[r].x20);
+                        }
+                        g_drv->hwbp_remove();
+                        g_drv->hwbp_clear_records(-1);
+                        return 0;
+                    }
+                }
+            }
+            // P 读不到: 落入通用 16 点位扫描 (挂 wrapper 本体)
+        }
+    }
+    printf("[*] 深读不可用 → 回落 16 点位扫描\n");
+    return CmdHwbpScan(wrap0, dur_ms, mode);
+}
+
+// ---------------- bpfollow: 读 W+0x188 指针 -> 挂点在指针目标 P+0xA8/P+0xB0/P+0x60 ----------------
+// 用法: bpfollow <hexWrapper> <dur_ms> [mode]   (战斗中挂点命中率极高频)
+static int CmdBpFollow(uint64_t W, uint32_t dur_ms, uint32_t mode) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+    uint64_t sv = 0;
+    if (!DrvReadAt(W + 0x188, &sv, 8)) {
+        printf("[X] 读 %p+0x188 失败 (隐藏区/未激活)\n", W); return 1;
+    }
+    uint64_t P = sv & 0xFFFFFFFFFFFFull;
+    printf("[*] W=0x%" PRIx64 "  W+0x188=0x%" PRIx64 " \n", W, sv);
+    if (P < 0x7000000000ull) { printf("[X] P 非法\n"); return 1; }
+    printf("[*] P = 0x%" PRIx64 " (via W+0x188)\n", P);
+
+    // 现值读取 (可能失败——失败也继续挂点)
+    uint8_t posb[16] = {0};
+    if (DrvReadAt(P + 0xA8, posb, 16)) {
+        uint32_t x, z, hpv, hmv;
+        memcpy(&x, posb, 4); memcpy(&z, posb + 8, 4);
+        memcpy(&hpv, posb + 0, 4);
+        printf("[*] 当前 P+0xA8..B7 = ");
+        for (int i = 0; i < 16; ++i) printf("%02x", posb[i]);
+        printf("  (int32@0=%d, @8=%d)\n", (int)x, (int)z);
+    } else {
+        printf("[!] P+0xA8 现值读失败 (仍可挂点)\n");
+    }
+
+    // 挂点: P+0xA8 / P+0xB0 (pos对) / P+0x60 / P+0x10 (alt 链)
+    static const uint64_t kTargets[] = { 0xA8, 0xB0, 0x60, 0x10 };
+    const size_t N = sizeof(kTargets) / sizeof(kTargets[0]);
+    std::vector<paradise_hwbp_point_config> pts(N);
+    for (size_t i = 0; i < N; ++i) {
+        pts[i].address = P + kTargets[i];
+        pts[i].type = mode ? mode : PARADISE_HWBP_READ_WRITE;
+        pts[i].length = 8;
+        pts[i].scope = PARADISE_HWBP_ALL_THREADS;
+        pts[i].reserved = 0;
+    }
+    printf("[*] bpfollow: 挂 %d 点 (P+0xA8/0xB0/0x60/0x10, mode=%u)\n", (int)N, mode);
+    if (!g_drv->hwbp_set(pts.data(), N)) { printf("[X] hwbp_set 失败\n"); return 1; }
+    struct timespec ts{dur_ms / 1000, (dur_ms % 1000) * 1000000};
+    nanosleep(&ts, nullptr);
+
+    const uint32_t CAP = 12;
+    static paradise_hwbp_record recs[CAP];
+    uint32_t total = 0;
+    for (size_t i = 0; i < N; ++i) {
+        uint32_t n = 0;
+        if (!g_drv->hwbp_get_records((uint32_t)i, 0, recs, CAP, &n)) continue;
+        printf("---- P+0x%llx hits=%u ----\n", (unsigned long long)kTargets[i], (unsigned)n);
+        for (uint32_t r = 0; r < n && r < CAP; ++r) {
+            total += n;
+            printf("  hit%u pc=0x%" PRIx64 " lr=0x%" PRIx64
+                   " x0=0x%" PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64
+                   " x8=0x%" PRIx64 " x19=0x%" PRIx64 " x20=0x%" PRIx64 "\n",
+                   r, recs[r].pc, recs[r].lr, recs[r].x0, recs[r].x1, recs[r].x2,
+                   recs[r].x8, recs[r].x19, recs[r].x20);
+        }
+    }
+    g_drv->hwbp_remove();
+    g_drv->hwbp_clear_records(-1);
+    if (total == 0)
+        printf("[!] %ums 无命中 — P 未被写 (对象可能未活)\n", dur_ms);
+    else
+        printf("[OK] bpfollow 完成 (有命中)\n");
+    return 0;
+}
+
+// ---------------- bpwar: 观察 recarray 10 个槽位 (+0x08/+0x0C 交替), 覆盖换局时机 ----------------
+// 用法: bpwar <dur_ms> [mode]  (挂上后什么都不用做, 等一场对局从载入到战斗全程, 打印每个新 wrapper 写入点)
+static int CmdBpWar(uint32_t dur_ms, uint32_t mode) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+    std::vector<Region> maps = ReadMaps(g_pid);
+    uint64_t bss = 0;
+    for (size_t i = 0; i < maps.size(); ++i) {
+        if (maps[i].path.find("libGameCore.so") == std::string::npos) continue;
+        for (size_t j = i + 1; j < maps.size(); ++j) {
+            if (maps[j].path.find(".bss") != std::string::npos &&
+                maps[j].start >= maps[i].end) { bss = maps[j].start; break; }
+        }
+        if (bss) break;
+    }
+    if (!bss) { printf("[X] 未找到 libGameCore .bss\n"); return 1; }
+
+    uint64_t root = 0;
+    const size_t CHUNK = 0x40000;
+    std::vector<uint8_t> blob(CHUNK);
+    for (uint64_t off = 0; off < (8ull << 20); off += CHUNK) {
+        if (!DrvReadAt(bss + off, blob.data(), CHUNK)) continue;
+        const uint64_t* U = reinterpret_cast<const uint64_t*>(blob.data());
+        for (size_t i = 0; i < CHUNK / 8; ++i) {
+            uint64_t v = U[i] & 0xFFFFFFFFFFFFull;
+            if (v < 0x7000000000ull) continue;
+            uint64_t w0 = 0, l1v = 0;
+            if (!DrvReadAt(v, &w0, 8)) continue;
+            if ((w0 & 0xFFFFFFFFFFFFull) != v) continue;
+            if (!DrvReadAt(v + 0x3D0, &l1v, 8)) continue;
+            l1v &= 0xFFFFFFFFFFFFull;
+            uint32_t a = 0, b2 = 0, recv = 0;
+            if (DrvReadAt(l1v + 0x58, &a, 4) && a == 16 &&
+                DrvReadAt(l1v + 0x5C, &b2, 4) && b2 == 10 &&
+                DrvReadAt(l1v + 0x40, &recv, 8)) { root = v; break; }
+        }
+        if (root) break;
+    }
+    if (!root) { printf("[X] engine_root 自证未命中\n"); return 1; }
+    uint64_t l1 = 0; DrvReadAt(root + 0x3D0, &l1, 8); l1 &= 0xFFFFFFFFFFFFull;
+    uint64_t rec = 0; DrvReadAt(l1 + 0x40, &rec, 8); rec &= 0xFFFFFFFFFFFFull;
+    printf("[*] bpwar: root=0x%" PRIx64 " recarray=0x%" PRIx64 " dur=%ums mode=%u\n",
+           root, rec, dur_ms, mode);
+
+    // 16 点: k=0..9 的 +0x08 (写新 wrapper 指针), +k=0..5 的 +0x0C (写 b400 系头)
+    std::vector<paradise_hwbp_point_config> pts(16);
+    for (size_t i = 0; i < 16; ++i) {
+        uint64_t o = (i < 10) ? (0x20ull * i + 0x08) : (0x20ull * (i - 10) + 0x0C);
+        pts[i].address = rec + o;
+        pts[i].type = mode ? mode : PARADISE_HWBP_READ_WRITE;
+        pts[i].length = 8;
+        pts[i].scope = PARADISE_HWBP_ALL_THREADS;
+        pts[i].reserved = 0;
+    }
+    printf("[*] 挂 16 点 (slot+0x08 ×10, slot+0x0C ×6) ... 开始观察 (此期间请从 载入→战斗 打完整一局)\n");
+    if (!g_drv->hwbp_set(pts.data(), 16)) { printf("[X] hwbp_set 失败\n"); return 1; }
+    struct timespec ts{dur_ms / 1000, (dur_ms % 1000) * 1000000};
+    nanosleep(&ts, nullptr);
+
+    const uint32_t CAP = 16;
+    static paradise_hwbp_record recs[CAP];
+    uint32_t grand = 0;
+    for (size_t i = 0; i < 16; ++i) {
+        uint32_t n = 0;
+        if (!g_drv->hwbp_get_records((uint32_t)i, 0, recs, CAP, &n)) continue;
+        uint64_t o = (i < 10) ? (0x20ull * i + 0x08) : (0x20ull * (i - 10) + 0x0C);
+        printf("---- rec+0x%03llx hits=%u ----\n", (unsigned long long)o, (unsigned)n);
+        for (uint32_t r = 0; r < n && r < CAP; ++r) {
+            grand += 1;
+            // x2 通常 = 写入的值 (新 wrapper 指针), x0 = 槽位地址
+            printf("  hit%u pc=0x%" PRIx64 " x0=0x%" PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64
+                   " x3=0x%" PRIx64 " x8=0x%" PRIx64 " lr=0x%" PRIx64 "\n",
+                   r, recs[r].pc, recs[r].x0, recs[r].x1, recs[r].x2,
+                   recs[r].x3, recs[r].x8, recs[r].lr);
+        }
+    }
+    g_drv->hwbp_remove();
+    g_drv->hwbp_clear_records(-1);
+    printf(grand ? "[OK] bpwar 完成 (命中 %u)\n" : "[!] %ums 无命中 (整段时间不在换局?\n", dur_ms);
+    return 0;
+}
+
+// ---------------- bplive: 全自动 (换局检测 -> 新wrapper -> P现值+观察点 -> live pos/hp) ----------------
+// 用法: bplive [dur_ms] [mode]  开着它打一整局即可; 有任一 hero 字段更新就打印现值+写入者
+static int CmdBpLive(uint32_t dur_ms, uint32_t mode) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+    std::vector<Region> maps = ReadMaps(g_pid);
+    uint64_t bss = 0;
+    for (size_t i = 0; i < maps.size(); ++i) {
+        if (maps[i].path.find("libGameCore.so") == std::string::npos) continue;
+        for (size_t j = i + 1; j < maps.size(); ++j) {
+            if (maps[j].path.find(".bss") != std::string::npos &&
+                maps[j].start >= maps[i].end) { bss = maps[j].start; break; }
+        }
+        if (bss) break;
+    }
+    if (!bss) { printf("[X] 未找到 .bss\n"); return 1; }
+    uint64_t root = 0;
+    const size_t CHUNK = 0x40000;
+    std::vector<uint8_t> blob(CHUNK);
+    for (uint64_t off = 0; off < (8ull << 20) && !root; off += CHUNK) {
+        if (!DrvReadAt(bss + off, blob.data(), CHUNK)) continue;
+        const uint64_t* U = reinterpret_cast<const uint64_t*>(blob.data());
+        for (size_t i = 0; i < CHUNK / 8; ++i) {
+            uint64_t v = U[i] & 0xFFFFFFFFFFFFull;
+            if (v < 0x7000000000ull) continue;
+            uint64_t w0 = 0, l1v = 0;
+            if (!DrvReadAt(v, &w0, 8)) continue;
+            if ((w0 & 0xFFFFFFFFFFFFull) != v) continue;
+            if (!DrvReadAt(v + 0x3D0, &l1v, 8)) continue;
+            l1v &= 0xFFFFFFFFFFFFull;
+            uint32_t a = 0, b2 = 0, recv = 0;
+            if (DrvReadAt(l1v + 0x58, &a, 4) && a == 16 &&
+                DrvReadAt(l1v + 0x5C, &b2, 4) && b2 == 10 &&
+                DrvReadAt(l1v + 0x40, &recv, 8)) { root = v; break; }
+        }
+    }
+    if (!root) { printf("[X] root 自证未命中\n"); return 1; }
+    uint64_t l1 = 0; DrvReadAt(root + 0x3D0, &l1, 8); l1 &= 0xFFFFFFFFFFFFull;
+    uint64_t rec = 0; DrvReadAt(l1 + 0x40, &rec, 8); rec &= 0xFFFFFFFFFFFFull;
+    printf("[*] bplive: root=0x%" PRIx64 " L1=0x%" PRIx64 " recarray=0x%" PRIx64
+           " dur=%ums mode=%u\n", root, l1, rec, dur_ms, mode);
+
+    uint32_t prev[10] = {0};
+    for (int k = 0; k < 10; ++k)
+        DrvReadAt(rec + 0x20ull * k + 0x08, &prev[k], 4);
+    printf("[*] baseline wrappointers: ");
+    for (int k = 0; k < 10; ++k) printf("%08x ", prev[k]);
+    printf("\n");
+
+    // 挂 16 点在 recarray 槽位 (捕获换局写入)
+    std::vector<paradise_hwbp_point_config> pts(16);
+    for (size_t i = 0; i < 16; ++i) {
+        uint64_t o = (i < 10) ? (0x20ull * i + 0x08) : (0x20ull * (i - 10) + 0x0C);
+        pts[i].address = rec + o;
+        pts[i].type = mode ? mode : PARADISE_HWBP_READ_WRITE;
+        pts[i].length = 8;
+        pts[i].scope = PARADISE_HWBP_ALL_THREADS;
+        pts[i].reserved = 0;
+    }
+    if (!g_drv->hwbp_set(pts.data(), 16)) { printf("[X] hwbp_set 失败\n"); return 1; }
+    printf("[*] recarray 16 点已挂 (等换局/首次指针写入). 开始轮询...\n");
+
+    const uint32_t POLL = 2000;
+    bool captured = false;
+    uint64_t liveW = 0, liveP = 0;
+    uint32_t loops = dur_ms / POLL;
+    for (uint32_t it = 0; it < loops; ++it) {
+        struct timespec ts{POLL / 1000, (POLL % 1000) * 1000000};
+        nanosleep(&ts, nullptr);
+        uint32_t cur[10]; int nch = 0; uint64_t chW = 0;
+        for (int k = 0; k < 10; ++k) {
+            uint32_t v = 0;
+            DrvReadAt(rec + 0x20ull * k + 0x08, &v, 4);
+            cur[k] = v;
+            if (v != prev[k]) {
+                printf("[chg] slot%d ptr %08x -> %08x (W=0x%llx)\n", k, prev[k], v,
+                       (unsigned long long)((0x73ull << 32) | v));
+                if (!chW) chW = (0x73ull << 32) | v;
+                nch++;
+            }
+        }
+        if (nch > 0 && !captured && chW) {
+            // 深读 chW+0x188
+            uint64_t sv = 0;
+            if (DrvReadAt(chW + 0x188, &sv, 8)) {
+                uint64_t P = sv & 0xFFFFFFFFFFFFull;
+                if (P >= 0x7000000000ull) {
+                    printf("[POINTER] W=0x%" PRIx64 " ->+0x188 P=0x%" PRIx64 "\n", chW, P);
+                    uint8_t pb[16] = {0};
+                    if (DrvReadAt(P + 0xA8, pb, 16)) {
+                        uint32_t x = 0, z = 0;
+                        memcpy(&x, pb, 4); memcpy(&z, pb + 8, 4);
+                        printf("[POINTER] P+0xA8..B7 = ");
+                        for (int i = 0; i < 16; ++i) printf("%02x", pb[i]);
+                        printf("  (int32@0=%d @8=%d 米(%d.%02d,%d.%02d))\n",
+                               (int)x, (int)z, (int)x/100, abs((int)x)%100, (int)z/100, abs((int)z)%100);
+                    } else {
+                        printf("[!] P+0xA8 现值读失败\n");
+                    }
+                    // 挂 P 的 2 点并取写入者
+                    uint32_t m2 = mode ? mode : PARADISE_HWBP_READ_WRITE;
+                    static const uint64_t kT[] = { 0xA8, 0xB0 };
+                    std::vector<paradise_hwbp_point_config> pts2(2);
+                    for (size_t i = 0; i < 2; ++i) {
+                        pts2[i].address = P + kT[i];
+                        pts2[i].type = m2; pts2[i].length = 8;
+                        pts2[i].scope = PARADISE_HWBP_ALL_THREADS;
+                        pts2[i].reserved = 0;
+                    }
+                    if (g_drv->hwbp_set(pts2.data(), 2)) {
+                        printf("[*] 已切换到 P+0xA8/P+0xB0 观察点\n");
+                        liveW = chW; liveP = P;
+                        captured = true;
+                        continue;   // 本次轮询结束, 下一轮开始 live pos 打印
+                    }
+                }
+            } else {
+                printf("[!] 深读 chW+0x188 失败 (页面仍隐藏/未映射), 继续轮询...\n");
+            }
+        }
+        // live pos 打印
+        if (captured && liveP) {
+            uint8_t pb[16] = {0};
+            if (DrvReadAt(liveP + 0xA8, pb, 16)) {
+                uint32_t x = 0, z = 0;
+                memcpy(&x, pb, 4); memcpy(&z, pb + 8, 4);
+                printf("[live t=%ums] pos_raw=(%d,%d) 米(%.2f,%.2f)\n",
+                       (it + 1) * POLL, (int)x, (int)z, (double)x / 100.0, (double)z / 100.0);
+            }
+            // 命中过后读一次记录 (写入者 PC 只打前几次)
+            static bool printed_once = false;
+            if (!printed_once) {
+                static paradise_hwbp_record recs[8];
+                for (size_t i = 0; i < 2; ++i) {
+                    uint32_t n = 0;
+                    if (g_drv->hwbp_get_records((uint32_t)i, 0, recs, 8, &n) && n) {
+                        for (uint32_t r = 0; r < n && r < 8; ++r)
+                            printf("[writer] P+0x%llx hit pc=0x%" PRIx64 " lr=0x%" PRIx64
+                                   " x0=0x%" PRIx64 " x1=0x%" PRIx64 " x2=0x%" PRIx64
+                                   " x8=0x%" PRIx64 " x19=0x%" PRIx64 " x20=0x%" PRIx64 "\n",
+                                   (unsigned long long)(i ? 0xB0 : 0xA8), recs[r].pc, recs[r].lr,
+                                   recs[r].x0, recs[r].x1, recs[r].x2,
+                                   recs[r].x8, recs[r].x19, recs[r].x20);
+                    }
+                }
+                printed_once = true;
+            }
+        }
+        memcpy(prev, cur, sizeof(prev));
+    }
+    g_drv->hwbp_remove();
+    g_drv->hwbp_clear_records(-1);
+    printf(captured ? "[OK] bplive 完成 (捕获并导出现值+写入者)\n"
+                    : "[!] %ums 无换局/无指针更新 (要覆盖一场完整载入->战斗)\n", dur_ms);
+    return 0;
+}
+
+// ---------------- bpdig: 读 W+0xD8 内容块 -> 16点覆盖 P+0x18..0x98 → 抓全部字段写入者 ----------------
+static int CmdBpDig(uint64_t W, uint32_t dur_ms, uint32_t mode) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+    uint64_t sv = 0;
+    if (!DrvReadAt(W + 0xD8, &sv, 8)) { printf("[X] 读 W+0xD8 失败\n"); return 1; }
+    uint64_t P = sv & 0xFFFFFFFFFFFFull;
+    if (P < 0x7000000000ull) { printf("[X] P 非法 (%#x)\n", (unsigned)sv); return 1; }
+    printf("[*] W=0x%" PRIx64 " W+0xD8 -> P = 0x%" PRIx64 "\n", W, P);
+    printf("[*] P 头部: ");
+    for (int i = 0; i < 8; ++i) {
+        uint64_t v; DrvReadAt(P + i * 8, &v, 8);
+        printf("%016llx ", (unsigned long long)v);
+    }
+    printf("\n");
+    const uint32_t NPTS = 16;
+    std::vector<paradise_hwbp_point_config> pts(NPTS);
+    for (size_t i = 0; i < NPTS; ++i) {
+        pts[i].address = P + 0x18ull + 8ull * i;
+        pts[i].type = mode ? mode : PARADISE_HWBP_READ_WRITE;
+        pts[i].length = 8;
+        pts[i].scope = PARADISE_HWBP_ALL_THREADS;
+        pts[i].reserved = 0;
+    }
+    printf("[*] bpdig: 挂 P+0x18..0x98 16点 mode=%u, 采样 %dms...\n", mode, dur_ms);
+    if (!g_drv->hwbp_set(pts.data(), NPTS)) { printf("[X] hwbp_set 失败\n"); return 1; }
+    struct timespec ts{dur_ms / 1000, (dur_ms % 1000) * 1000000};
+    nanosleep(&ts, nullptr);
+    const uint32_t CAP = 12;
+    static paradise_hwbp_record recs[CAP];
+    uint32_t total = 0;
+    for (size_t i = 0; i < NPTS; ++i) {
+        uint32_t n = 0;
+        if (!g_drv->hwbp_get_records((uint32_t)i, 0, recs, CAP, &n)) continue;
+        if (!n) continue;
+        printf("---- P+0x%03llx hits=%u ----\n", (unsigned long long)(0x18 + 8 * i), (unsigned)n);
+        for (uint32_t r = 0; r < n && r < CAP; ++r) {
+            total++;
+            printf("  pc=0x%" PRIx64 " lr=0x%" PRIx64 " x0=0x%" PRIx64 " x1=0x%" PRIx64
+                   " x2=0x%" PRIx64 " x3=0x%" PRIx64 " x8=0x%" PRIx64 " x19=0x%" PRIx64 " x20=0x%" PRIx64 "\n",
+                   recs[r].pc, recs[r].lr, recs[r].x0, recs[r].x1, recs[r].x2,
+                   recs[r].x3, recs[r].x8, recs[r].x19, recs[r].x20);
+        }
+    }
+    g_drv->hwbp_remove();
+    g_drv->hwbp_clear_records(-1);
+    printf(total ? "[OK] bpdig 完成 (命中 %u)\n" : "[!] %ums 无命中\n", dur_ms);
+    return 0;
+}
+
+// ---------------- bpsweep: 对指定对象全域做 16点×分块 移窗扫描 ----------------
+static int CmdBpSweep(uint64_t obj, uint64_t span, uint32_t per_ms, uint32_t mode) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+    uint64_t stripe = 0x80ull;   // 16 点 × 8B = 128B = 0x80
+    const uint32_t NPTS = 16;
+    std::vector<paradise_hwbp_point_config> pts(NPTS);
+    uint32_t total = 0;
+    for (uint64_t baseOff = 0; baseOff < span; baseOff += stripe) {
+        for (size_t i = 0; i < NPTS; ++i) {
+            pts[i].address = obj + baseOff + i * 8;
+            pts[i].type = mode ? mode : PARADISE_HWBP_READ_WRITE;
+            pts[i].length = 8;
+            pts[i].scope = PARADISE_HWBP_ALL_THREADS;
+            pts[i].reserved = 0;
+        }
+        if (!g_drv->hwbp_set(pts.data(), NPTS)) { printf("[X] hwbp_set 失败 @+%llx\n", (unsigned long long)baseOff); break; }
+        struct timespec ts{per_ms / 1000, (per_ms % 1000) * 1000000};
+        nanosleep(&ts, nullptr);
+        static paradise_hwbp_record recs[4];
+        for (size_t i = 0; i < NPTS; ++i) {
+            uint32_t n = 0;
+            if (!g_drv->hwbp_get_records((uint32_t)i, 0, recs, 4, &n)) continue;
+            for (uint32_t r = 0; r < n && r < 4; ++r) {
+                total += n;
+                printf("obj+0x%04llx %s[hit%u] pc=0x%" PRIx64 " x0=0x%" PRIx64 " x1=0x%" PRIx64
+                       " x2=0x%" PRIx64 " x8=0x%" PRIx64 " lr=0x%" PRIx64 "\n",
+                       (unsigned long long)(baseOff + i * 8),
+                       "", r, recs[r].pc, recs[r].x0, recs[r].x1, recs[r].x2, recs[r].x8, recs[r].lr);
+            }
+        }
+        g_drv->hwbp_clear_records(-1);
+    }
+    g_drv->hwbp_remove();
+    printf(total ? "[OK] bpsweep 完成 (命中 %u)\n" : "[!] 全域窗口无命中\n");
+    return 0;
+}
+
+// ---------------- hwbp_selftest: 端到端验证驱动观察点是否真实工作 ----------------
+static int CmdHwbpSelfTest(void) {
+    if (g_pid > 0) g_drv->initialize(g_pid);
+    volatile uint64_t myvar = 0;    // 会把读写落在自己栈/静态区的变量
+    pid_t save = 0;
+    // 用自己进程测试, 还原目标 pid
+    FILE* f = fopen("/proc/self/stat", "r");
+    if (f) { long v = 0; if (fscanf(f, "%ld", &v) == 1) save = (pid_t)v; fclose(f); }
+    g_drv->initialize(save ? save : getpid());
+    paradise_hwbp_point_config pc{}; pc.address = (uintptr_t)&myvar;
+    pc.type = PARADISE_HWBP_READ_WRITE; pc.length = 8;
+    pc.scope = PARADISE_HWBP_ALL_THREADS; pc.reserved = 0;
+    if (!g_drv->hwbp_set(&pc, 1)) { printf("[X] hwbp_set 失败\n"); return 1; }
+    myvar = 0x11112222;             // 触发一次写
+    uint64_t tmp = myvar;           // 触发一次读
+    printf("[*] 已写已读 0x%llx (期望 hit≥1)\n", (unsigned long long)tmp);
+    struct timespec ts{0, 300 * 1000000};
+    nanosleep(&ts, nullptr);
+    static paradise_hwbp_record recs[8];
+    uint32_t n = 0;
+    int ok = g_drv->hwbp_get_records(0, 0, recs, 8, &n);
+    printf("[*] get_records rc=%d count=%u\n", ok, (unsigned)n);
+    for (uint32_t i = 0; i < n; ++i)
+        printf("  hit%u pc=0x%" PRIx64 " x0=0x%" PRIx64 " lr=0x%" PRIx64 "\n", i, recs[i].pc, recs[i].x0, recs[i].lr);
+    g_drv->hwbp_remove(); g_drv->hwbp_clear_records(-1);
+    if (g_pid > 0) g_drv->initialize(g_pid);   // 还原目标
+    printf(n ? "[OK] hwbp 链路正常 (自证命中 %u)\n" : "[X] hwbp 未产生记录 — 驱动观察点未生效\n", (unsigned)n);
+    return n ? 0 : 2;
+}
+
 // ================= 用法 =================
 static void Usage() {
     printf("best-king · 独立内存 dump 工具（Paradise 驱动专用, 硬闸门）\n");
@@ -385,6 +998,12 @@ static void Usage() {
     printf("  maps   [过滤]                        maps 打印\n");
     printf("  range  <hex址> <hex长> <out.bin>     任意区间 dump\n");
     printf("  dumpgame <out.bin> <out.idx>         一键圈选匿名堆区+bss（索引含完整 maps）\n");
+    printf("  hwbp_scan <hexAddr> <dur_ms> [m]     16点观察点扫描(0x130..0x2C8) m:2=w 3=rw 4=x\n");
+    printf("  bpauto [dur_ms] [m]                  自动取根->挂点->采样 (战中跑这条) m:2=w 3=rw 4=x\n");
+    printf("  bpfollow <hexW> <dur_ms> [m]         读W+0x188指针->挂指针目标 P+0xA8/0xB0\n");
+    printf("  bpdig <hexW> <dur_ms> [m]            W+0xD8 内容块 -> P+0x18..0x98 16观察点\n");
+    printf("  bpsweep <hexObj> <hexSpan> <每区ms> [m]  16点×分块移窗扫对象全域\n");
+    printf("  bplive [dur_ms] [m]                  ★全自动: 开着打一局, 自动等到换局→新wrapper→live pos/hp+写入者\n");
     printf("默认目标: %s\n", kDefaultTarget);
     printf("示例: King.sh dumpgame /data/adb/JAY/game.bin /data/adb/JAY/game.idx\n");
 }
@@ -446,6 +1065,53 @@ int main(int argc, char** argv) {
         if (args.size() < 3) { Usage(); return 2; }
         return CmdDumpGame(args[1], args[2]);
     }
+    if (cmd == "hwbp_scan") {
+        if (args.size() < 3) { Usage(); return 2; }
+        uint32_t mode = PARADISE_HWBP_READ_WRITE;
+        if (args.size() > 3) mode = (uint32_t)strtoul(args[3].c_str(), nullptr, 0);
+        return CmdHwbpScan(strtoull(args[1].c_str(), nullptr, 16),
+                           (uint32_t)strtoul(args[2].c_str(), nullptr, 10), mode);
+    }
+    if (cmd == "bpauto") {
+        uint32_t mode = PARADISE_HWBP_READ_WRITE;
+        if (args.size() > 2) mode = (uint32_t)strtoul(args[2].c_str(), nullptr, 0);
+        uint32_t dur = args.size() > 1 ? (uint32_t)strtoul(args[1].c_str(), nullptr, 10) : 20000;
+        return CmdBpAuto(dur, mode);
+    }
+    if (cmd == "bpfollow") {
+        if (args.size() < 2) { Usage(); return 2; }
+        uint32_t mode = PARADISE_HWBP_READ_WRITE;
+        if (args.size() > 3) mode = (uint32_t)strtoul(args[3].c_str(), nullptr, 0);
+        uint32_t dur = args.size() > 2 ? (uint32_t)strtoul(args[2].c_str(), nullptr, 10) : 20000;
+        return CmdBpFollow(strtoull(args[1].c_str(), nullptr, 16), dur, mode);
+    }
+    if (cmd == "bpwar") {
+        uint32_t mode = PARADISE_HWBP_READ_WRITE;
+        if (args.size() > 2) mode = (uint32_t)strtoul(args[2].c_str(), nullptr, 0);
+        uint32_t dur = args.size() > 1 ? (uint32_t)strtoul(args[1].c_str(), nullptr, 10) : 300000;
+        return CmdBpWar(dur, mode);
+    }
+    if (cmd == "bplive") {
+        uint32_t mode = PARADISE_HWBP_READ_WRITE;
+        if (args.size() > 2) mode = (uint32_t)strtoul(args[2].c_str(), nullptr, 0);
+        uint32_t dur = args.size() > 1 ? (uint32_t)strtoul(args[1].c_str(), nullptr, 10) : 600000;
+        return CmdBpLive(dur, mode);
+    }
+    if (cmd == "bpdig") {
+        if (args.size() < 2) { Usage(); return 2; }
+        uint32_t mode = PARADISE_HWBP_READ_WRITE;
+        if (args.size() > 3) mode = (uint32_t)strtoul(args[3].c_str(), nullptr, 0);
+        uint32_t dur = args.size() > 2 ? (uint32_t)strtoul(args[2].c_str(), nullptr, 10) : 10000;
+        return CmdBpDig(strtoull(args[1].c_str(), nullptr, 16), dur, mode);
+    }
+    if (cmd == "bpsweep") {
+        if (args.size() < 4) { Usage(); return 2; }
+        uint32_t mode = PARADISE_HWBP_READ_WRITE;
+        if (args.size() > 4) mode = (uint32_t)strtoul(args[4].c_str(), nullptr, 0);
+        uint32_t per_ms = ((args.size() > 3) ? (uint32_t)strtoul(args[3].c_str(), nullptr, 10) : 300);
+        return CmdBpSweep(strtoull(args[1].c_str(), nullptr, 16), strtoull(args[2].c_str(), nullptr, 16), per_ms, mode);
+    }
+    if (cmd == "hwbp_selftest") return CmdHwbpSelfTest();
     Usage();
     return 2;
 }
