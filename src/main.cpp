@@ -570,7 +570,7 @@ static int CmdBpFollow(uint64_t W, uint32_t dur_ms, uint32_t mode) {
     g_drv->initialize(g_pid);
     uint64_t sv = 0;
     if (!DrvReadAt(W + 0x188, &sv, 8)) {
-        printf("[X] 读 %p+0x188 失败 (隐藏区/未激活)\n", W); return 1;
+        printf("[X] 读 0x%" PRIx64 "+0x188 失败 (隐藏区/未激活)\n", W); return 1;
     }
     uint64_t P = sv & 0xFFFFFFFFFFFFull;
     printf("[*] W=0x%" PRIx64 "  W+0x188=0x%" PRIx64 " \n", W, sv);
@@ -954,7 +954,8 @@ static int CmdBpSweep(uint64_t obj, uint64_t span, uint32_t per_ms, uint32_t mod
         g_drv->hwbp_clear_records(-1);
     }
     g_drv->hwbp_remove();
-    printf(total ? "[OK] bpsweep 完成 (命中 %u)\n" : "[!] 全域窗口无命中\n");
+    if (total) printf("[OK] bpsweep 完成 (命中 %u)\n", (unsigned)total);
+    else printf("[!] 全域窗口无命中\n");
     return 0;
 }
 
@@ -988,6 +989,66 @@ static int CmdHwbpSelfTest(void) {
     return n ? 0 : 2;
 }
 
+static bool DrvWriteAt(uint64_t addr, const void* buf, size_t size) {
+    if (!g_drv || size == 0) return false;
+    return g_drv->write((uintptr_t)addr, (void*)buf, size);
+}
+
+// ---- 写内存命令族 (读回自动验证; 测试建议: 读原值->写回同值->读回) ----
+static int CmdRd(uint64_t addr, size_t len) {
+    if (len == 0) { printf("[!] 长度 0\n"); return 2; }
+    if (len > 4096) { printf("[!] 长度上限 4096\n"); return 2; }
+    std::vector<uint8_t> buf(len);
+    if (!DrvReadAt(addr, buf.data(), len)) { printf("[X] 读失败 %#llx\n", (unsigned long long)addr); return 1; }
+    printf("[OK] rd %#llx + %zu:\n", (unsigned long long)addr, len);
+    for (size_t i = 0; i < len; ++i) {
+        if (i % 16 == 0) printf("  %04zx: ", i);
+        printf("%02x ", buf[i]);
+        if (i % 16 == 15 || i + 1 == len) printf("\n");
+    }
+    return 0;
+}
+static int CmdWriteVerify(const char* tag, uint64_t addr, const void* p, size_t n) {
+    if (!DrvWriteAt(addr, p, n)) { printf("[X] %s 写失败 @%#llx\n", tag, (unsigned long long)addr); return 1; }
+    std::vector<uint8_t> rb(n);
+    bool ver = DrvReadAt(addr, rb.data(), n) && memcmp(rb.data(), p, n) == 0;
+    printf("[OK] %s @%#llx + %zu 字节 读回=%s\n", tag, (unsigned long long)addr, n, ver ? "一致" : "不一致!");
+    return ver ? 0 : 3;
+}
+static int CmdPoke(const std::string& addrS, const std::string& hexS) {
+    uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
+    if (hexS.empty() || (hexS.size() % 2)) { printf("[!] 字节串需偶数长度十六进制, 例: poke 0x1234 0102a0ff\n"); return 2; }
+    auto hexval = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::vector<uint8_t> buf;
+    buf.reserve(hexS.size() / 2);
+    for (size_t i = 0; i < hexS.size(); i += 2) {
+        int hi = hexval(hexS[i]), lo = hexval(hexS[i + 1]);
+        if (hi < 0 || lo < 0) { printf("[!] 非法十六进制字符\n"); return 2; }
+        buf.push_back((uint8_t)((hi << 4) | lo));
+    }
+    return CmdWriteVerify("poke", addr, buf.data(), buf.size());
+}
+static int CmdW32(const std::string& addrS, const std::string& valS) {
+    uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
+    uint32_t v = (uint32_t)strtoull(valS.c_str(), nullptr, 0);
+    return CmdWriteVerify("w32", addr, &v, 4);
+}
+static int CmdW64(const std::string& addrS, const std::string& valS) {
+    uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
+    uint64_t v = strtoull(valS.c_str(), nullptr, 0);
+    return CmdWriteVerify("w64", addr, &v, 8);
+}
+static int CmdWf(const std::string& addrS, const std::string& valS) {
+    uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
+    float f = strtof(valS.c_str(), nullptr);
+    return CmdWriteVerify("wf", addr, &f, 4);
+}
+
 // ================= 用法 =================
 static void Usage() {
     printf("best-king · 独立内存 dump 工具（Paradise 驱动专用, 硬闸门）\n");
@@ -1003,6 +1064,11 @@ static void Usage() {
     printf("  bpfollow <hexW> <dur_ms> [m]         读W+0x188指针->挂指针目标 P+0xA8/0xB0\n");
     printf("  bpdig <hexW> <dur_ms> [m]            W+0xD8 内容块 -> P+0x18..0x98 16观察点\n");
     printf("  bpsweep <hexObj> <hexSpan> <每区ms> [m]  16点×分块移窗扫对象全域\n");
+    printf("  rd     <hex址> <hex长>               驱动读并十六进制打印(≤4096)\n");
+    printf("  poke   <hex址> <hex字节串>           驱动写原始字节+读回验证\n");
+    printf("  w32    <hex址> <值>                  驱动写 u32 (值支持 0x/十进制)+读回\n");
+    printf("  w64    <hex址> <值>                  驱动写 u64 +读回\n");
+    printf("  wf     <hex址> <浮点>                驱动写 float +读回\n");
     printf("  bplive [dur_ms] [m]                  ★全自动: 开着打一局, 自动等到换局→新wrapper→live pos/hp+写入者\n");
     printf("默认目标: %s\n", kDefaultTarget);
     printf("示例: King.sh dumpgame /data/adb/JAY/game.bin /data/adb/JAY/game.idx\n");
@@ -1110,6 +1176,26 @@ int main(int argc, char** argv) {
         if (args.size() > 4) mode = (uint32_t)strtoul(args[4].c_str(), nullptr, 0);
         uint32_t per_ms = ((args.size() > 3) ? (uint32_t)strtoul(args[3].c_str(), nullptr, 10) : 300);
         return CmdBpSweep(strtoull(args[1].c_str(), nullptr, 16), strtoull(args[2].c_str(), nullptr, 16), per_ms, mode);
+    }
+    if (cmd == "rd") {
+        if (args.size() < 3) { Usage(); return 2; }
+        return CmdRd(strtoull(args[1].c_str(), nullptr, 16), (size_t)strtoull(args[2].c_str(), nullptr, 16));
+    }
+    if (cmd == "poke") {
+        if (args.size() < 3) { Usage(); return 2; }
+        return CmdPoke(args[1], args[2]);
+    }
+    if (cmd == "w32") {
+        if (args.size() < 3) { Usage(); return 2; }
+        return CmdW32(args[1], args[2]);
+    }
+    if (cmd == "w64") {
+        if (args.size() < 3) { Usage(); return 2; }
+        return CmdW64(args[1], args[2]);
+    }
+    if (cmd == "wf") {
+        if (args.size() < 3) { Usage(); return 2; }
+        return CmdWf(args[1], args[2]);
     }
     if (cmd == "hwbp_selftest") return CmdHwbpSelfTest();
     Usage();
