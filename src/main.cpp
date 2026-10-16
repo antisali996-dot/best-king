@@ -1018,6 +1018,7 @@ static int CmdWriteVerify(const char* tag, uint64_t addr, const void* p, size_t 
 static int CmdPoke(const std::string& addrS, const std::string& hexS) {
     uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
     if (hexS.empty() || (hexS.size() % 2)) { printf("[!] 字节串需偶数长度十六进制, 例: poke 0x1234 0102a0ff\n"); return 2; }
+    if (hexS.size() > 8192) { printf("[!] 字节串上限 4096 字节\n"); return 2; }
     auto hexval = [](char c) -> int {
         if (c >= '0' && c <= '9') return c - '0';
         if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -1035,17 +1036,25 @@ static int CmdPoke(const std::string& addrS, const std::string& hexS) {
 }
 static int CmdW32(const std::string& addrS, const std::string& valS) {
     uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
-    uint32_t v = (uint32_t)strtoull(valS.c_str(), nullptr, 0);
-    return CmdWriteVerify("w32", addr, &v, 4);
+    char* end = nullptr;
+    unsigned long long v = strtoull(valS.c_str(), &end, 0);
+    if (!end || end == valS.c_str() || *end) { printf("[!] 值解析失败: %s\n", valS.c_str()); return 2; }
+    if (v > 0xFFFFFFFFull) { printf("[!] 值超出 u32 范围: %s\n", valS.c_str()); return 2; }
+    uint32_t vv = (uint32_t)v;
+    return CmdWriteVerify("w32", addr, &vv, 4);
 }
 static int CmdW64(const std::string& addrS, const std::string& valS) {
     uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
-    uint64_t v = strtoull(valS.c_str(), nullptr, 0);
+    char* end = nullptr;
+    uint64_t v = strtoull(valS.c_str(), &end, 0);
+    if (!end || end == valS.c_str() || *end) { printf("[!] 值解析失败: %s\n", valS.c_str()); return 2; }
     return CmdWriteVerify("w64", addr, &v, 8);
 }
 static int CmdWf(const std::string& addrS, const std::string& valS) {
     uint64_t addr = strtoull(addrS.c_str(), nullptr, 16);
-    float f = strtof(valS.c_str(), nullptr);
+    char* end = nullptr;
+    float f = strtof(valS.c_str(), &end);
+    if (!end || end == valS.c_str() || *end) { printf("[!] 浮点解析失败: %s\n", valS.c_str()); return 2; }
     return CmdWriteVerify("wf", addr, &f, 4);
 }
 
