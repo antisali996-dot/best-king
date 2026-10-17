@@ -351,6 +351,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
 
     std::vector<uint8_t> buf(g_chunk);
     std::vector<std::pair<uint64_t, uint64_t>> failRanges;   // 逐块失败区间 (addr, size)
+    uint64_t failDropped = 0;                                // 超过记录上限而未能记录的失败块数
     uint64_t foff = 0, fails = 0;
     for (size_t i = 0; i < sels.size(); ++i) {
         fprintf(fi, "%" PRIu64 " 0x%012" PRIx64 " %" PRIu64 " %s\n",
@@ -361,6 +362,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
             if (!DrvReadAt(sels[i].start + done, buf.data(), n)) {
                 fails += n;
                 if (failRanges.size() < 200000) failRanges.push_back({sels[i].start + done, (uint64_t)n});
+                else failDropped++;
                 memset(buf.data(), 0, n);
             }
             if (fwrite(buf.data(), 1, n, fb) != n) {
@@ -381,6 +383,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
     for (const auto& fr : failRanges) {
         fprintf(fi, "#FAIL %012" PRIx64 " %" PRIu64 "\n", fr.first, fr.second);
     }
+    if (failDropped) fprintf(fi, "#FAIL-TRUNC %" PRIu64 "\n", failDropped);
     fclose(fb);
     fclose(fi);
     printf("[OK] dumpgame -> %s (%" PRIu64 " MB), 索引 -> %s（读失败 %" PRIu64 " 字节, %zu 块）\n",
@@ -1295,9 +1298,9 @@ static int CmdSkillDump(const std::string& outPath) {
     FILE* fo = fopen(outPath.c_str(), "w");
     if (!fo) { printf("[X] 无法写 %s\n", outPath.c_str()); return 1; }
     // 相机缓存帧号（一致性参考）: bss+0x38A140 -> class -> +0xB8 -> sf -> +0 -> cam -> +0x58 -> cache
-    uint64_t camFrame = 0;
-    unsigned camValid = 0;
-    bool camOk = false;
+    uint32_t camFrame = 0;
+    uint8_t camValid = 0;
+    bool camOk = false, camValidOk = false;
     {
         uint64_t c = 0;
         if (RdQ(bss + 0x38A140, &c)) {
@@ -1311,17 +1314,18 @@ static int CmdSkillDump(const std::string& outPath) {
                     uint64_t cache = 0;
                     if (cam && RdQ(cam + 0x58, &cache)) {
                         cache &= MASK48;
-                        if (cache && RdQ(cache + 0x48, &camFrame)) camOk = true;
-                        if (cache) DrvReadAt(cache + 0x50, &camValid, 1);
+                        if (cache && RdU32(cache + 0x48, &camFrame)) camOk = true;
+                        if (cache) camValidOk = RdU8(cache + 0x50, &camValid);
                     }
                 }
             }
         }
     }
     char camFrameStr[32], camValidStr[16];
-    if (camOk) snprintf(camFrameStr, sizeof(camFrameStr), "%" PRIu64, camFrame);
+    if (camOk) snprintf(camFrameStr, sizeof(camFrameStr), "%u", camFrame);
     else snprintf(camFrameStr, sizeof(camFrameStr), "ERR");
-    snprintf(camValidStr, sizeof(camValidStr), "%u", camValid);
+    if (camOk && camValidOk) snprintf(camValidStr, sizeof(camValidStr), "%u", (unsigned)camValid);
+    else snprintf(camValidStr, sizeof(camValidStr), "ERR");
     std::string tStart = NowStr();
     fprintf(fo, "# skilldump pid=%d img=0x%" PRIx64 " bss=0x%" PRIx64 " bss_size=0x%" PRIx64
                 " start=%s cam_frame=%s cam_valid=%s\n",
