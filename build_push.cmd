@@ -43,7 +43,7 @@ if exist "%PUSH%" (
 
 rem ---- 推送设备侧脚本 (批量抓帧/一键快照/自动采集) ----
 set "PUSH=%~dp0..\xiaogu-kernel\tools\jay_push.cmd"
-for %%F in (King_shot.sh King_snap.sh collect.sh start_collect.sh) do (
+for %%F in (King_shot.sh King_snap.sh collect.sh start_collect.sh stop_collect.sh) do (
     if exist "%PUSH%" (
         call "%PUSH%" "%%F" "%%F"
         if errorlevel 1 exit /b 1
