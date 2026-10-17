@@ -1568,7 +1568,7 @@ static int CmdFrameSnap(const std::string& outPath) {
             if (lst && RdQ(lst + 0x8, &arr)) {
                 arr &= M48;
                 ok = arr && RdU32(lst + 0x10, &cnt) && RdQ(arr + 0x10, &cap)
-                     && cap >= cnt && cap <= 65536 && cnt <= kMaxRec;
+                     && cap >= cnt && cap <= 65536;   // 超 kMaxRec 时按循环上限截断(同 skilldump)
             }
         }
         if (!firstList) fprintf(fo, ",");

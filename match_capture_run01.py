@@ -63,6 +63,17 @@ def main():
             pid = line.strip()
     if pid:
         st = sh('ls -ld --time-style=+%%Y-%%m-%%dT%%H:%%M:%%S /proc/%s' % pid)
+        if not re.search(r'\d{4}-\d{2}-\d{2}T', st):
+            # toybox ls 不支持 --time-style 时: /proc/<pid>/stat 第22字段 + /proc/stat btime
+            pstat = sh('cat /proc/%s/stat' % pid)
+            boot = sh('grep -m1 btime /proc/stat')
+            try:
+                ticks = int(pstat.split(') ')[1].split()[19])
+                btime = int(boot.split()[1])
+                st = 'epoch=%d (%s)' % (btime + ticks // 100,
+                                        time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(btime + ticks // 100)))
+            except Exception:
+                st = st.strip() or 'unknown'
         log('PID=%s 进程启动: %s' % (pid, st.strip()))
     # 2) maps.txt
     mp = sh(K + ' maps')
@@ -92,12 +103,16 @@ def main():
                     break
                 time.sleep(0.5)
             dst = os.path.join(OUT, name)
+            pulled = False
             for _ in range(6):
                 p = subprocess.run([ADB, 'pull', '/sdcard/_v01_' + name, dst], capture_output=True, timeout=600)
                 if p.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 0:
                     log('拉回 %s (%d B)' % (name, os.path.getsize(dst)))
+                    pulled = True
                     break
                 time.sleep(0.6)
+            if not pulled:
+                log('!! 拉回失败: %s' % name)
             sh('rm -f /sdcard/_v01_%s' % name)
     # 5) 投影快照: framesnap + 截图（尽量贴近同一时刻）
     sh(K + ' framesnap /data/adb/JAY/val/framesnap.json')
@@ -105,6 +120,8 @@ def main():
     if fs.strip():
         open(os.path.join(OUT, 'framesnap_proj.json'), 'w', encoding='utf-8').write(fs)
         log('framesnap_proj.json (%d B)' % len(fs))
+    else:
+        log('!! framesnap 输出为空（链未就绪或不在对局）')
     screenshot('shot_proj.png')
     # 6) CD 三段采样
     log('CD 采样开始 (%ds)：请现在释放一个普通技能' % dur)
@@ -127,6 +144,8 @@ def main():
             m3 = re.match(r'\s+Hero\[(\d+)\].*?id=\((\d+),(\d+)\)', line)
             if m3:
                 hero_id = m3.group(2)
+            elif re.match(r'\s+Hero\[(\d+)\].*id=ERR', line):
+                hero_id = ''
             m4 = re.match(r'\s+slot\[(\d+)\] type=(\d+) lvl=(\d+) cd=(-?\d+) cdmax=(-?\d+) maxcd=(-?\d+) ready=(\d+)', line)
             if m4:
                 series.append(dict(time=stamp, cam_frame=cam_frame, hero=hero_id,
@@ -165,9 +184,13 @@ def main():
                 break
             time.sleep(0.6)
         sh('rm -f /sdcard/_v01_meta.dat')
-        with open(os.path.join(OUT, 'metadata-source.txt'), 'w', encoding='utf-8') as f:
-            f.write(md + '\n')
-        log('metadata 导出: %s' % md)
+        mpath = os.path.join(OUT, 'metadata', 'global-metadata.dat')
+        if os.path.exists(mpath) and os.path.getsize(mpath) > 0:
+            with open(os.path.join(OUT, 'metadata-source.txt'), 'w', encoding='utf-8') as f:
+                f.write(md + '\n')
+            log('metadata 导出: %s (%d B)' % (md, os.path.getsize(mpath)))
+        else:
+            log('!! metadata 拉回失败: %s' % md)
     else:
         log('!! maps 中未找到 global-metadata 映射')
     log('=== run-01 采集完成 ===')
