@@ -1335,7 +1335,7 @@ static int CmdSkillDump(const std::string& outPath) {
         }
     }
     char camFrameStr[32], camValidStr[16];
-    if (camOk) snprintf(camFrameStr, sizeof(camFrameStr), "%u", camFrame);
+    if (camOk && camValidOk) snprintf(camFrameStr, sizeof(camFrameStr), "%u", camFrame);
     else snprintf(camFrameStr, sizeof(camFrameStr), "ERR");
     if (camOk && camValidOk) snprintf(camValidStr, sizeof(camValidStr), "%u", (unsigned)camValid);
     else snprintf(camValidStr, sizeof(camValidStr), "ERR");
