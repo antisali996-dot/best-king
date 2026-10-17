@@ -20,10 +20,12 @@ WARMUP = 25          # 投影前站定等待（给用户看提示的时间）
 def sh(cmd, tries=6, timeout=900, raw=False):
     for _ in range(tries):
         try:
-            args = [ADB] + (['exec-out'] if raw else ['shell', 'su', '-c', 'nsenter -t 1 -m -- ' + cmd])
+            args = [ADB] + ([('exec-out' if raw else 'shell'), 'su', '-c', 'nsenter -t 1 -m -- ' + cmd])
             p = subprocess.run(args, capture_output=True, timeout=timeout)
             if raw:
-                return p.stdout
+                if p.stdout:
+                    return p.stdout
+                continue   # 空输出重试
             out = p.stdout.decode('utf-8', errors='replace')
             if out.strip():
                 return out
@@ -84,6 +86,7 @@ def main():
     # 3) 站定等待 -> 投影快照
     log('请站定不动：%d 秒后采投影（framesnap+截图）' % WARMUP)
     time.sleep(WARMUP)
+    screenshot('shot_proj.png')
     sh(K + ' framesnap /data/adb/JAY/val/framesnap.json')
     fs = sh('cat /data/adb/JAY/val/framesnap.json')
     if fs.strip():
@@ -91,10 +94,11 @@ def main():
         log('framesnap_proj.json (%d B): %s' % (len(fs), fs.strip()[:160]))
     else:
         log('!! framesnap 输出为空（链未就绪或不在对局）')
-    screenshot('shot_proj.png')
+    screenshot('shot_proj2.png')
     # 4) CD 三段采样（释放前/冷却中/恢复后）
     log('CD 采样开始 (%ds)：接下来请正常对局，找个机会放一个普通技能（冷却全程自动记录）' % dur)
     series = []
+    last_cd_shot = 0.0
     t_end = time.time() + dur
     while time.time() < t_end:
         sh(K + ' skilldump /data/adb/JAY/val/skills.txt', tries=2, timeout=120)
@@ -119,8 +123,12 @@ def main():
                                    lvl=int(m4.group(3)), cur_cd=int(m4.group(4)),
                                    cd_max=int(m4.group(5)), max_cd=int(m4.group(6)),
                                    ready=int(m4.group(7))))
-        if not os.path.exists(os.path.join(OUT, 'shot_cd.png')) and any(r['cur_cd'] > 0 for r in series):
-            screenshot('shot_cd.png')
+        if any(r['cur_cd'] > 0 for r in series) and (time.time() - last_cd_shot) > 30:
+            for cand in ('shot_cd.png', 'shot_cd2.png', 'shot_cd3.png'):
+                if not os.path.exists(os.path.join(OUT, cand)):
+                    if screenshot(cand):
+                        last_cd_shot = time.time()
+                    break
         time.sleep(0.6)
     # 相位标注（按 hero+slot 分组）：cd>0 -> during；首次跳变前的 0 -> pre；跳变后的 0 -> post
     groups = defaultdict(list)
