@@ -399,6 +399,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx, c
     if (failDropped) fprintf(fi, "#FAIL-TRUNC %" PRIu64 "\n", failDropped);
     fclose(fb);
     fclose(fi);
+    if (fs) fclose(fs);
     printf("[OK] dumpgame -> %s (%" PRIu64 " MB), 索引 -> %s（读失败 %" PRIu64 " 字节, %zu 块）\n",
            out_bin.c_str(), foff >> 20, out_idx.c_str(), fails, failRanges.size());
     if (fails > 0) printf("[!] 有读失败（已填零，索引含 #FAIL 区间）\n");
@@ -1517,7 +1518,12 @@ static int CmdFrameSnap(const std::string& outPath) {
         return cur;
     };
     const uint64_t camSystem = follow(bss + 0x38A140, {0xB8, 0x0});
-    const uint64_t cache = camSystem ? follow(camSystem, {0x58}) : 0;
+    // CameraCache = *(CameraSystem + 0x58)  (直读，勿多跳)
+    uint64_t cache = 0;
+    if (camSystem) {
+        uint64_t cv = 0;
+        if (RdQ(camSystem + 0x58, &cv)) cache = cv & M48;
+    }
     uint32_t camFrame = 0;
     uint8_t camValid = 0;
     int frameOk = 0, validOk = 0, vpOk = 0;
@@ -1537,7 +1543,13 @@ static int CmdFrameSnap(const std::string& outPath) {
     else
         fprintf(fo, "\"cam_frame\":null,\"cam_valid\":null,");
     fprintf(fo, "\"vp\":[");
+    bool vpFinite = vpOk;
     if (vpOk) {
+        for (int i = 0; i < 16; ++i) {
+            if (!std::isfinite(vp[i])) { vpFinite = false; break; }
+        }
+    }
+    if (vpFinite) {
         for (int i = 0; i < 16; ++i) fprintf(fo, "%s%.9g", i ? "," : "", vp[i]);
     } else {
         fprintf(fo, "null");
@@ -1590,7 +1602,7 @@ static int CmdFrameSnap(const std::string& outPath) {
     }
     fprintf(fo, "}}\n");
     fclose(fo);
-    printf("[OK] framesnap -> %s (vp=%d frame=%d valid=%d)\n", outPath.c_str(), vpOk, frameOk, validOk);
+    printf("[OK] framesnap -> %s (vp=%d frame=%d valid=%d)\n", outPath.c_str(), vpFinite ? 1 : 0, frameOk, validOk);
     return 0;
 }
 
