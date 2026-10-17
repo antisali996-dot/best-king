@@ -197,7 +197,8 @@ def main():
                 break
     if md:
         os.makedirs(os.path.join(OUT, 'metadata'), exist_ok=True)
-        sh('cp "%s" /sdcard/_v01_meta.dat' % md)
+        # 运行时文件全路径含 $ 符号, 会被 shell 展开 -> 用 * 通配符规避(不加引号)
+        sh('cp %s /sdcard/_v01_meta.dat' % md.replace('$', '*'))
         for _ in range(5):
             p = subprocess.run([ADB, 'pull', '/sdcard/_v01_meta.dat', os.path.join(OUT, 'metadata', 'global-metadata.dat')],
                                capture_output=True, timeout=600)
