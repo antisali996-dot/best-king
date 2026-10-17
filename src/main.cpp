@@ -24,6 +24,7 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <unistd.h>
 #include "paradise_api.h"
 
@@ -349,6 +350,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
     fprintf(fi, "# off start size name\n");
 
     std::vector<uint8_t> buf(g_chunk);
+    std::vector<std::pair<uint64_t, uint64_t>> failRanges;   // 逐块失败区间 (addr, size)
     uint64_t foff = 0, fails = 0;
     for (size_t i = 0; i < sels.size(); ++i) {
         fprintf(fi, "%" PRIu64 " 0x%012" PRIx64 " %" PRIu64 " %s\n",
@@ -358,6 +360,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
             size_t n = (size_t)std::min<uint64_t>(g_chunk, sels[i].size - done);
             if (!DrvReadAt(sels[i].start + done, buf.data(), n)) {
                 fails += n;
+                if (failRanges.size() < 200000) failRanges.push_back({sels[i].start + done, (uint64_t)n});
                 memset(buf.data(), 0, n);
             }
             if (fwrite(buf.data(), 1, n, fb) != n) {
@@ -374,11 +377,15 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
         }
         fflush(fb);
     }
+    // 逐块失败区间（供离线区分: 未选择 / 失败填零 / 真实零值）
+    for (const auto& fr : failRanges) {
+        fprintf(fi, "#FAIL %012" PRIx64 " %" PRIu64 "\n", fr.first, fr.second);
+    }
     fclose(fb);
     fclose(fi);
-    printf("[OK] dumpgame -> %s (%" PRIu64 " MB), 索引 -> %s（读失败 %" PRIu64 " 字节）\n",
-           out_bin.c_str(), foff >> 20, out_idx.c_str(), fails);
-    if (fails > 0) printf("[!] 有读失败（已填零）\n");
+    printf("[OK] dumpgame -> %s (%" PRIu64 " MB), 索引 -> %s（读失败 %" PRIu64 " 字节, %zu 块）\n",
+           out_bin.c_str(), foff >> 20, out_idx.c_str(), fails, failRanges.size());
+    if (fails > 0) printf("[!] 有读失败（已填零，索引含 #FAIL 区间）\n");
     return 0;
 }
 
@@ -1233,6 +1240,19 @@ static bool RdI32(const uint64_t a, int32_t* v) { return DrvReadAt(a, v, 4); }
 static bool RdF32(const uint64_t a, float* v) { return DrvReadAt(a, v, 4); }
 static bool RdU8(const uint64_t a, uint8_t* v) { return DrvReadAt(a, v, 1); }
 
+static std::string NowStr() {
+    char ts[64] = {0};
+    time_t t = time(nullptr);
+    struct tm tmv;
+#if defined(_WIN32)
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    return std::string(ts);
+}
+
 static int CmdSkillDump(const std::string& outPath) {
     if (g_pid <= 0) return 2;
     g_drv->initialize(g_pid);
@@ -1274,8 +1294,43 @@ static int CmdSkillDump(const std::string& outPath) {
     printf("[*] ActorManager=0x%" PRIx64 "\n", am);
     FILE* fo = fopen(outPath.c_str(), "w");
     if (!fo) { printf("[X] 无法写 %s\n", outPath.c_str()); return 1; }
-    fprintf(fo, "# skilldump pid=%d img=0x%" PRIx64 " bss=0x%" PRIx64 " bss_size=0x%" PRIx64 "\n",
-            (int)g_pid, imgBase, bss, bssSz);
+    // 相机缓存帧号（一致性参考）: bss+0x38A140 -> class -> +0xB8 -> sf -> +0 -> cam -> +0x58 -> cache
+    uint64_t camFrame = 0;
+    unsigned camValid = 0;
+    bool camOk = false;
+    {
+        uint64_t c = 0;
+        if (RdQ(bss + 0x38A140, &c)) {
+            c &= MASK48;
+            uint64_t sf2 = 0;
+            if (c && RdQ(c + 0xB8, &sf2)) {
+                sf2 &= MASK48;
+                uint64_t cam = 0;
+                if (sf2 && RdQ(sf2, &cam)) {
+                    cam &= MASK48;
+                    uint64_t cache = 0;
+                    if (cam && RdQ(cam + 0x58, &cache)) {
+                        cache &= MASK48;
+                        if (cache && RdQ(cache + 0x48, &camFrame)) camOk = true;
+                        if (cache) DrvReadAt(cache + 0x50, &camValid, 1);
+                    }
+                }
+            }
+        }
+    }
+    char camFrameStr[32], camValidStr[16];
+    if (camOk) snprintf(camFrameStr, sizeof(camFrameStr), "%" PRIu64, camFrame);
+    else snprintf(camFrameStr, sizeof(camFrameStr), "ERR");
+    snprintf(camValidStr, sizeof(camValidStr), "%u", camValid);
+    std::string tStart = NowStr();
+    fprintf(fo, "# skilldump pid=%d img=0x%" PRIx64 " bss=0x%" PRIx64 " bss_size=0x%" PRIx64
+                " start=%s cam_frame=%s cam_valid=%s\n",
+            (int)g_pid, imgBase, bss, bssSz, tStart.c_str(), camFrameStr, camValidStr);
+    fprintf(fo, "# offsets slot=0x%" PRIx64 " list=(0x18,0x20,0x28,0x30,0x38,0x48) rec_stride=0x10\n",
+            kIl2cppBssSlot);
+    fprintf(fo, "# offsets record: handle+0x0 linker+0x8 ; linker: ids+0x4A8/+0x4AC pos+0x4C4\n");
+    fprintf(fo, "# offsets slots: comp=linker+0x28 array=comp+0x28 len+0x10 entry=array+0x18+i*8"
+                " fields=(0x30,0x38,0x5C,0x60,0x64,0x74)\n");
     struct LDef { uint64_t off; const char* name; bool dumpSlots; };
     const LDef lists[] = {
         {0x18, "Hero", true}, {0x20, "Organ", false}, {0x28, "Tower", false},
@@ -1402,7 +1457,8 @@ static int CmdSkillDump(const std::string& outPath) {
         }
         fflush(fo);
     }
-    fprintf(fo, "# summary records=%d chain_fails=%d list_fails=%d\n", totalRec, chainFails, listFails);
+    fprintf(fo, "# summary records=%d chain_fails=%d list_fails=%d end=%s\n",
+            totalRec, chainFails, listFails, NowStr().c_str());
     fflush(fo);
     fclose(fo);
     if (totalRec == 0 || listFails >= 6) {
