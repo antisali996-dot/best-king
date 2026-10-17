@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <chrono>
 #include <unistd.h>
 #include "paradise_api.h"
 
@@ -283,7 +284,7 @@ static int CmdRange(uint64_t addr, uint64_t size, const std::string& out) {
 
 // 一键圈选"分析用"内存: game 侧匿名堆区 + 全部 [anon:.bss]
 // 输出: 单个连续 bin + 索引文本（含完整 maps 副本, "#MAP " 前缀行）
-static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
+static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx, const std::string& out_status) {
     std::vector<Region> maps = ReadMaps(g_pid);
     if (maps.empty()) {
         printf("[!] 读取 maps 失败\n");
@@ -336,10 +337,13 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
 
     FILE* fb = fopen(out_bin.c_str(), "wb");
     FILE* fi = fopen(out_idx.c_str(), "w");
-    if (!fb || !fi) {
-        printf("[!] 无法写文件: %s / %s\n", out_bin.c_str(), out_idx.c_str());
+    FILE* fs = nullptr;
+    if (!out_status.empty()) fs = fopen(out_status.c_str(), "w");
+    if (!fb || !fi || (!out_status.empty() && !fs)) {
+        printf("[!] 无法写文件: %s / %s / %s\n", out_bin.c_str(), out_idx.c_str(), out_status.c_str());
         if (fb) fclose(fb);
         if (fi) fclose(fi);
+        if (fs) fclose(fs);
         return 1;
     }
     for (size_t i = 0; i < maps.size(); ++i) {
@@ -353,22 +357,31 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
     std::vector<std::pair<uint64_t, uint64_t>> failRanges;   // 逐块失败区间 (addr, size)
     uint64_t failDropped = 0;                                // 超过记录上限而未能记录的失败块数
     uint64_t foff = 0, fails = 0;
+    auto t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < sels.size(); ++i) {
         fprintf(fi, "%" PRIu64 " 0x%012" PRIx64 " %" PRIu64 " %s\n",
                 foff, sels[i].start, sels[i].size, sels[i].name.c_str());
         uint64_t done = 0;
         while (done < sels[i].size) {
             size_t n = (size_t)std::min<uint64_t>(g_chunk, sels[i].size - done);
-            if (!DrvReadAt(sels[i].start + done, buf.data(), n)) {
+            bool ok = DrvReadAt(sels[i].start + done, buf.data(), n);
+            if (!ok) {
                 fails += n;
                 if (failRanges.size() < 200000) failRanges.push_back({sels[i].start + done, (uint64_t)n});
                 else failDropped++;
                 memset(buf.data(), 0, n);
             }
+            if (fs) {
+                double tms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - t0).count();
+                fprintf(fs, "{\"addr\":\"0x%012" PRIx64 "\",\"req\":%zu,\"got\":%zu,\"ok\":%d,\"t_ms\":%.1f}\n",
+                        sels[i].start + done, n, ok ? n : (size_t)0, ok ? 1 : 0, tms);
+            }
             if (fwrite(buf.data(), 1, n, fb) != n) {
                 printf("[!] 写盘失败（空间不足?）: %s\n", out_bin.c_str());
                 fclose(fb);
                 fclose(fi);
+                if (fs) fclose(fs);
                 return 1;
             }
             done += n;
@@ -1474,6 +1487,113 @@ static int CmdSkillDump(const std::string& outPath) {
     return 0;
 }
 
+// ---------------- framesnap: 投影数据快照 ----------------
+// 用法: framesnap <out.json>
+// 输出: 采样时间 / cam_frame+valid / VP 矩阵(16 float) / 英雄与塔的渲染坐标
+static int CmdFrameSnap(const std::string& outPath) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+    std::vector<Region> maps = ReadMaps(g_pid);
+    if (maps.empty()) { printf("[!] maps 读取失败\n"); return 1; }
+    const uint64_t M48 = 0xFFFFFFFFFFFFull;
+    uint64_t bss = 0, bssSz = 0;
+    for (size_t i = 1; i < maps.size(); ++i) {
+        if (maps[i].path.find(".bss") == std::string::npos) continue;
+        if (maps[i].start != maps[i - 1].end) continue;
+        if (maps[i - 1].path.find("libil2cpp") == std::string::npos) continue;
+        bss = maps[i].start;
+        bssSz = maps[i].end - maps[i].start;
+        break;
+    }
+    if (!bss || bssSz < kIl2cppBssMinSize) { printf("[X] libil2cpp BSS 不可用\n"); return 1; }
+    auto follow = [&](uint64_t base, const std::vector<uint64_t>& offs) -> uint64_t {
+        uint64_t v = 0;
+        if (!RdQ(base, &v)) return 0;
+        uint64_t cur = v & M48;
+        for (uint64_t off : offs) {
+            if (!cur || !RdQ(cur + off, &v)) return 0;
+            cur = v & M48;
+        }
+        return cur;
+    };
+    const uint64_t camSystem = follow(bss + 0x38A140, {0xB8, 0x0});
+    const uint64_t cache = camSystem ? follow(camSystem, {0x58}) : 0;
+    uint32_t camFrame = 0;
+    uint8_t camValid = 0;
+    int frameOk = 0, validOk = 0, vpOk = 0;
+    float vp[16];
+    memset(vp, 0, sizeof(vp));
+    if (cache) {
+        frameOk = RdU32(cache + 0x48, &camFrame) ? 1 : 0;
+        validOk = RdU8(cache + 0x50, &camValid) ? 1 : 0;
+        vpOk = DrvReadAt(cache + 0x8, vp, 64) ? 1 : 0;
+    }
+    const uint64_t am = follow(bss + 0x3A0FC0, {0xB8, 0x0});
+    FILE* fo = fopen(outPath.c_str(), "w");
+    if (!fo) { printf("[X] 无法写 %s\n", outPath.c_str()); return 1; }
+    fprintf(fo, "{\"time\":\"%s\",\"pid\":%d,", NowStr().c_str(), (int)g_pid);
+    if (frameOk && validOk)
+        fprintf(fo, "\"cam_frame\":%u,\"cam_valid\":%u,", camFrame, (unsigned)camValid);
+    else
+        fprintf(fo, "\"cam_frame\":null,\"cam_valid\":null,");
+    fprintf(fo, "\"vp\":[");
+    if (vpOk) {
+        for (int i = 0; i < 16; ++i) fprintf(fo, "%s%.9g", i ? "," : "", vp[i]);
+    } else {
+        fprintf(fo, "null");
+    }
+    fprintf(fo, "],\"lists\":{");
+    struct LDef { uint64_t off; const char* name; };
+    const LDef lists[] = {{0x18, "Hero"}, {0x28, "Tower"}, {0x30, "Soldier"}, {0x48, "BuffMonster"}};
+    bool firstList = true;
+    for (const auto& L : lists) {
+        uint64_t lst = 0, arr = 0;
+        uint32_t cnt = 0;
+        uint64_t cap = 0;
+        bool ok = false;
+        if (am && RdQ(am + L.off, &lst)) {
+            lst &= M48;
+            if (lst && RdQ(lst + 0x8, &arr)) {
+                arr &= M48;
+                ok = arr && RdU32(lst + 0x10, &cnt) && RdQ(arr + 0x10, &cap)
+                     && cap >= cnt && cap <= 65536 && cnt <= kMaxRec;
+            }
+        }
+        if (!firstList) fprintf(fo, ",");
+        firstList = false;
+        fprintf(fo, "\"%s\":[", L.name);
+        if (ok) {
+            bool firstRec = true;
+            for (uint32_t i = 0; i < cnt && i < kMaxRec; ++i) {
+                uint64_t rec = arr + 0x18 + (uint64_t)i * 0x10;
+                uint32_t handle = 0;
+                uint64_t lk = 0;
+                if (!RdU32(rec, &handle) || !RdQ(rec + 0x8, &lk)) continue;
+                lk &= M48;
+                uint32_t lh = 0;
+                if (!lk || !RdU32(lk + 0x8, &lh) || lh != handle) continue;
+                uint32_t id1 = 0, id2 = 0;
+                float px = 0, py = 0, pz = 0;
+                bool okId = RdU32(lk + 0x4A8, &id1) && RdU32(lk + 0x4AC, &id2);
+                bool okPos = RdF32(lk + 0x4C4, &px) && RdF32(lk + 0x4C8, &py) && RdF32(lk + 0x4CC, &pz);
+                bool posFinite = okPos && std::isfinite(px) && std::isfinite(py) && std::isfinite(pz)
+                                 && std::fabs(px) < 10000 && std::fabs(py) < 10000 && std::fabs(pz) < 10000;
+                fprintf(fo, "%s{\"idx\":%u,\"id\":[%u,%u],\"pos\":", firstRec ? "" : ",", i,
+                        okId ? id1 : 0, okId ? id2 : 0);
+                if (posFinite) fprintf(fo, "[%.3f,%.3f,%.3f]", px, py, pz);
+                else fprintf(fo, "null");
+                fprintf(fo, "}");
+                firstRec = false;
+            }
+        }
+        fprintf(fo, "]");
+    }
+    fprintf(fo, "}}\n");
+    fclose(fo);
+    printf("[OK] framesnap -> %s (vp=%d frame=%d valid=%d)\n", outPath.c_str(), vpOk, frameOk, validOk);
+    return 0;
+}
+
 // ================= 用法 =================
 static void Usage() {    printf("best-king · 独立内存 dump 工具（Paradise 驱动专用, 硬闸门）\n");
     printf("用法: King.sh [--target pkg|pid] [--chunk N] <命令> ...\n");
@@ -1482,7 +1602,7 @@ static void Usage() {    printf("best-king · 独立内存 dump 工具（Paradis
     printf("  mods   [过滤]                        模块列表\n");
     printf("  maps   [过滤]                        maps 打印\n");
     printf("  range  <hex址> <hex长> <out.bin>     任意区间 dump\n");
-    printf("  dumpgame <out.bin> <out.idx>         一键圈选匿名堆区+bss（索引含完整 maps）\n");
+    printf("  dumpgame <out.bin> <out.idx> [read-status.jsonl]  一键圈选匿名堆区+bss（可选逐块读取状态）\n");
     printf("  hwbp_scan <hexAddr> <dur_ms> [m]     16点观察点扫描(0x130..0x2C8) m:2=w 3=rw 4=x\n");
     printf("  bpauto [dur_ms] [m]                  自动取根->挂点->采样 (战中跑这条) m:2=w 3=rw 4=x\n");
     printf("  bpfollow <hexW> <dur_ms> [m]         读W+0x188指针->挂指针目标 P+0xA8/0xB0\n");
@@ -1496,6 +1616,7 @@ static void Usage() {    printf("best-king · 独立内存 dump 工具（Paradis
     printf("  scan   <out.bin> <hex址> <hex长> <类型> <下限> <上限>  值扫描 (i32/u32/f32/i16/u16/i8/u8)\n");
     printf("  sscan  <in.bin> <out.bin> <类型> <模式>              复扫收缩 (same/changed/dec/inc)\n");
     printf("  skilldump <out.txt>                  单位列表(英雄/塔/兵/Buff)+技能槽 一键采样\n");
+    printf("  framesnap <out.json>                 投影快照: VP矩阵+英雄/塔渲染坐标+时间/frame\n");
     printf("  bplive [dur_ms] [m]                  ★全自动: 开着打一局, 自动等到换局→新wrapper→live pos/hp+写入者\n");
     printf("默认目标: %s\n", kDefaultTarget);
     printf("示例: King.sh dumpgame /data/adb/JAY/game.bin /data/adb/JAY/game.idx\n");
@@ -1529,7 +1650,7 @@ int main(int argc, char** argv) {
             return g;
         }
         printf("[*] 自动 dump → /data/adb/JAY/game.bin + game.idx（对局内执行效果最佳）\n\n");
-        const int rc = CmdDumpGame("/data/adb/JAY/game.bin", "/data/adb/JAY/game.idx");
+        const int rc = CmdDumpGame("/data/adb/JAY/game.bin", "/data/adb/JAY/game.idx", "/data/adb/JAY/game.read.jsonl");
         printf("\n[完成] dumpgame rc=%d\n", rc);
         if (rc == 0) printf("[完成] 把 /data/adb/JAY/game.bin 和 game.idx 发我即可\n");
         return rc;
@@ -1556,7 +1677,11 @@ int main(int argc, char** argv) {
     }
     if (cmd == "dumpgame") {
         if (args.size() < 3) { Usage(); return 2; }
-        return CmdDumpGame(args[1], args[2]);
+        return CmdDumpGame(args[1], args[2], args.size() > 3 ? args[3] : "");
+    }
+    if (cmd == "framesnap") {
+        if (args.size() < 2) { Usage(); return 2; }
+        return CmdFrameSnap(args[1]);
     }
     if (cmd == "hwbp_scan") {
         if (args.size() < 3) { Usage(); return 2; }
