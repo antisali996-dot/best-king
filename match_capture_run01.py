@@ -69,7 +69,6 @@ def main():
     open(os.path.join(OUT, 'maps.txt'), 'w', encoding='utf-8').write(mp)
     log('maps.txt (%d 行)' % len(mp.splitlines()))
     # 3) 全量快照 + 逐块读取状态
-    os.makedirs('/data/adb/JAY/val/', exist_ok=True) if False else None
     sh('mkdir -p /data/adb/JAY/val')
     ok = False
     for attempt in range(3):
