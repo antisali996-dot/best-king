@@ -11,6 +11,7 @@
 //    maps   [过滤]                          maps 打印
 //    range  <hex起始> <hex长度> <out.bin>   任意区间 dump
 //    dumpgame <out.bin> <out.idx>           一键圈选匿名堆区+[anon:.bss]（索引含完整 maps）
+//    skilldump <out.txt>                    单位列表+技能槽 一键采样
 //  默认目标: com.tencent.tmgp.sgame
 // ============================================================================
 #include <cinttypes>
@@ -22,6 +23,7 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 #include <unistd.h>
 #include "paradise_api.h"
 
@@ -290,7 +292,7 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
     std::vector<Sel> sels;
     const uint64_t LIMIT_TOTAL = 6000ull << 20;
     const uint64_t LIMIT_ONE = 2048ull << 20;
-    const uint64_t MIN_ONE  = 256ull << 10;   // 256KB
+    const uint64_t MIN_ONE  = 4ull << 10;     // 4KB (原 256KB 会漏掉小匿名区)
     uint64_t total = 0;
     int skipped = 0;
     for (size_t i = 0; i < maps.size(); ++i) {
@@ -299,7 +301,11 @@ static int CmdDumpGame(const std::string& out_bin, const std::string& out_idx) {
         const bool isBss = (r.path.find(".bss") != std::string::npos);
         const bool inWin = (r.start >= 0x7000000000ull && r.start < 0x7C00000000ull);
         if (!isBss && !inWin) continue;
-        if (!r.path.empty() && r.path[0] != '[') continue;
+        const bool anonPath = r.path.empty() || r.path[0] == '[';
+        // 文件映射: 仅纳入 /lib/arm64/ 下的可写数据段(.data)，跳过代码/只读/dalvik
+        const bool isLibData = (r.path.find("/lib/arm64/") != std::string::npos) &&
+                               (strchr(r.perms, 'w') != nullptr);
+        if (!anonPath && !isLibData) continue;
         uint64_t sz = r.end - r.start;
         if (sz < MIN_ONE) continue;
         if (total >= LIMIT_TOTAL) {
@@ -1205,9 +1211,211 @@ static int CmdSScan(const std::string& inS, const std::string& outS,
     return 0;
 }
 
+// ---------------- skilldump: 单位列表 + 技能槽 一键采样 ----------------
+// 用法: skilldump <out.txt>
+// 链（本样本验证）:
+//   il2cpp.bss + 0x3A0FC0 -> SingletonClass (+0xB8) -> StaticFields (+0x0) -> ActorManager
+//   ActorManager + {0x18 Hero,0x20 Organ,0x28 Tower,0x30 Soldier,0x38 Dragon,0x48 BuffMonster} -> List
+//   List+0x8 -> Array ; List+0x10 -> count ; Array+0x10 -> capacity
+//   record = Array + 0x18 + i*0x10 ; record+0x0 handle ; record+0x8 -> ActorLinker
+//   ActorLinker+0x8 == handle ; +0x4A8/+0x4AC ids ; +0x4C4 3xfloat (渲染坐标)
+//   英雄技能槽: ActorLinker+0x28 -> SkillLinkerComponent ; +0x28 -> slot array ; +0x10 len
+//   slot = array + 0x18 + i*8 ; +0x30 type +0x38 lvl +0x5C cd +0x60 cdmax +0x64 maxcd +0x74 ready
+// 读失败一律落 "ERR" 占位, 不写成 0 (与项目既有约定一致)。
+static const uint32_t kMaxRec   = 512;
+static const uint32_t kMaxSlots = 32;
+static const uint64_t kIl2cppBssSlot    = 0x3A0FC0;
+static const uint64_t kIl2cppBssMinSize = 0x3A0FC8;
+
+static bool RdQ(const uint64_t a, uint64_t* v) { return DrvReadAt(a, v, 8); }
+static bool RdU32(const uint64_t a, uint32_t* v) { return DrvReadAt(a, v, 4); }
+static bool RdI32(const uint64_t a, int32_t* v) { return DrvReadAt(a, v, 4); }
+static bool RdF32(const uint64_t a, float* v) { return DrvReadAt(a, v, 4); }
+static bool RdU8(const uint64_t a, uint8_t* v) { return DrvReadAt(a, v, 1); }
+
+static int CmdSkillDump(const std::string& outPath) {
+    if (g_pid <= 0) return 2;
+    g_drv->initialize(g_pid);
+    std::vector<Region> maps = ReadMaps(g_pid);
+    if (maps.empty()) { printf("[!] maps 读取失败\n"); return 1; }
+    const uint64_t MASK48 = 0xFFFFFFFFFFFFull;
+    // 真实镜像基址: libil2cpp 的 offset=0 段中取最小者（排除保护层整文件只读映射）
+    uint64_t imgBase = 0, imgMin = ~0ull;
+    for (const auto& r : maps) {
+        if (r.path.find("libil2cpp") == std::string::npos) continue;
+        if (r.offset != 0) continue;
+        uint64_t sz = r.end - r.start;
+        if (sz < imgMin) { imgMin = sz; imgBase = r.start; }
+    }
+    // .bss: 紧跟 libil2cpp 段之后的 [anon:.bss]
+    uint64_t bss = 0, bssSz = 0;
+    for (size_t i = 1; i < maps.size(); ++i) {
+        if (maps[i].path.find(".bss") == std::string::npos) continue;
+        if (maps[i].start != maps[i - 1].end) continue;
+        if (maps[i - 1].path.find("libil2cpp") == std::string::npos) continue;
+        bss = maps[i].start;
+        bssSz = maps[i].end - maps[i].start;
+        break;
+    }
+    printf("[*] il2cpp image=0x%" PRIx64 " bss=0x%" PRIx64 " size=0x%" PRIx64 "\n", imgBase, bss, bssSz);
+    if (!imgBase || !bss) { printf("[X] 未定位 libil2cpp 镜像/BSS\n"); return 1; }
+    if (bssSz < kIl2cppBssMinSize) {
+        printf("[X] bss 尺寸 0x%" PRIx64 " < 0x%" PRIx64 "（链路超出 BSS，快照不完整）\n", bssSz, kIl2cppBssMinSize);
+        return 1;
+    }
+    uint64_t v = 0;
+    if (!RdQ(bss + kIl2cppBssSlot, &v)) { printf("[X] 读 bss+0x%llX 失败\n", (unsigned long long)kIl2cppBssSlot); return 1; }
+    uint64_t cls = v & MASK48;
+    if (!cls || !RdQ(cls + 0xB8, &v)) { printf("[X] SingletonClass 链断\n"); return 1; }
+    uint64_t sf = v & MASK48;
+    if (!sf || !RdQ(sf, &v)) { printf("[X] StaticFields 链断\n"); return 1; }
+    uint64_t am = v & MASK48;
+    if (!am) { printf("[X] ActorManager 为空（不在对局？）\n"); return 1; }
+    printf("[*] ActorManager=0x%" PRIx64 "\n", am);
+    FILE* fo = fopen(outPath.c_str(), "w");
+    if (!fo) { printf("[X] 无法写 %s\n", outPath.c_str()); return 1; }
+    fprintf(fo, "# skilldump pid=%d img=0x%" PRIx64 " bss=0x%" PRIx64 " bss_size=0x%" PRIx64 "\n",
+            (int)g_pid, imgBase, bss, bssSz);
+    struct LDef { uint64_t off; const char* name; bool dumpSlots; };
+    const LDef lists[] = {
+        {0x18, "Hero", true}, {0x20, "Organ", false}, {0x28, "Tower", false},
+        {0x30, "Soldier", false}, {0x38, "Dragon", false}, {0x48, "BuffMonster", false},
+    };
+    int totalRec = 0, chainFails = 0, listFails = 0;
+    for (const auto& L : lists) {
+        uint64_t lst = 0;
+        if (!RdQ(am + L.off, &lst)) {
+            fprintf(fo, "LIST %s FAIL(am+0x%llX)\n", L.name, (unsigned long long)L.off);
+            listFails++; continue;
+        }
+        lst &= MASK48;
+        if (!lst) { fprintf(fo, "LIST %s EMPTY(null)\n", L.name); continue; }
+        uint64_t arr = 0;
+        if (!RdQ(lst + 0x8, &arr)) {
+            fprintf(fo, "LIST %s list=0x%" PRIx64 " FAIL(array)\n", L.name, lst);
+            listFails++; continue;
+        }
+        arr &= MASK48;
+        uint32_t cnt = 0;
+        if (!RdU32(lst + 0x10, &cnt)) {
+            fprintf(fo, "LIST %s list=0x%" PRIx64 " FAIL(count)\n", L.name, lst);
+            listFails++; continue;
+        }
+        if (!arr) {
+            fprintf(fo, "LIST %s list=0x%" PRIx64 " array=NULL count=%u (skip)\n", L.name, lst, cnt);
+            listFails++; continue;
+        }
+        uint64_t cap = 0;
+        if (!RdQ(arr + 0x10, &cap)) {
+            fprintf(fo, "LIST %s list=0x%" PRIx64 " array=0x%" PRIx64 " cap=ERR (skip)\n", L.name, lst, arr);
+            listFails++; continue;
+        }
+        if (cnt > cap || cap > 65536) {
+            fprintf(fo, "LIST %s INVALID count=%u cap=%" PRIu64 " (skip)\n", L.name, cnt, cap);
+            listFails++; continue;
+        }
+        fprintf(fo, "LIST %s list=0x%" PRIx64 " array=0x%" PRIx64 " count=%u capacity=%" PRIu64 "\n",
+                L.name, lst, arr, cnt, cap);
+        uint32_t nrec = cnt;
+        if (nrec > kMaxRec) {
+            fprintf(fo, "  [!] %s count=%u > %u，已截断\n", L.name, cnt, kMaxRec);
+            nrec = kMaxRec;
+        }
+        for (uint32_t i = 0; i < nrec; ++i) {
+            uint64_t rec = arr + 0x18 + (uint64_t)i * 0x10;
+            uint32_t handle = 0;
+            if (!RdU32(rec, &handle)) {
+                fprintf(fo, "  %s[%u] handle=ERR\n", L.name, i);
+                chainFails++; continue;
+            }
+            uint64_t lk = 0;
+            if (!RdQ(rec + 0x8, &lk)) {
+                fprintf(fo, "  %s[%u] handle=%u linker=ERR\n", L.name, i, handle);
+                chainFails++; continue;
+            }
+            lk &= MASK48;
+            if (!lk) {
+                fprintf(fo, "  %s[%u] handle=%u linker=NULL\n", L.name, i, handle);
+                continue;
+            }
+            uint32_t lkHandle = 0;
+            int ok = (RdU32(lk + 0x8, &lkHandle) && lkHandle == handle) ? 1 : 0;
+            uint32_t id1 = 0, id2 = 0;
+            bool okId = RdU32(lk + 0x4A8, &id1) && RdU32(lk + 0x4AC, &id2);
+            float px = 0, py = 0, pz = 0;
+            bool okPos = RdF32(lk + 0x4C4, &px) && RdF32(lk + 0x4C8, &py) && RdF32(lk + 0x4CC, &pz);
+            bool posFinite = okPos && std::isfinite(px) && std::isfinite(py) && std::isfinite(pz)
+                             && std::fabs(px) < 10000 && std::fabs(py) < 10000 && std::fabs(pz) < 10000;
+            char idbuf[64], posbuf[96];
+            if (ok && okId) snprintf(idbuf, sizeof(idbuf), "(%u,%u)", id1, id2);
+            else snprintf(idbuf, sizeof(idbuf), "ERR");
+            if (ok && posFinite) snprintf(posbuf, sizeof(posbuf), "(%.3f,%.3f,%.3f)", px, py, pz);
+            else snprintf(posbuf, sizeof(posbuf), "ERR");
+            fprintf(fo, "  %s[%u] handle=%u linker=0x%" PRIx64 " ok=%d id=%s pos=%s\n",
+                    L.name, i, handle, lk, ok, idbuf, posbuf);
+            totalRec++;
+            if (L.dumpSlots && ok) {
+                uint64_t comp = 0;
+                if (!RdQ(lk + 0x28, &comp)) {
+                    fprintf(fo, "    SLOTS FAIL(component)\n");
+                } else {
+                    comp &= MASK48;
+                    uint64_t slots = 0;
+                    if (!comp || !RdQ(comp + 0x28, &slots)) {
+                        fprintf(fo, "    SLOTS FAIL(array)\n");
+                    } else {
+                        slots &= MASK48;
+                        uint32_t len = 0;
+                        if (!slots || !RdU32(slots + 0x10, &len)) {
+                            fprintf(fo, "    SLOTS len=ERR\n");
+                        } else {
+                            uint32_t n2 = len;
+                            if (n2 > kMaxSlots) {
+                                fprintf(fo, "    [!] SLOTS len=%u > %u，已截断\n", len, kMaxSlots);
+                                n2 = kMaxSlots;
+                            }
+                            fprintf(fo, "    SLOTS array=0x%" PRIx64 " len=%u\n", slots, len);
+                            for (uint32_t k = 0; k < n2; ++k) {
+                                uint64_t e = 0;
+                                if (!RdQ(slots + 0x18 + (uint64_t)k * 8, &e)) {
+                                    fprintf(fo, "      slot[%u] entry=ERR\n", k);
+                                    continue;
+                                }
+                                e &= MASK48;
+                                if (!e) { fprintf(fo, "      slot[%u] entry=NULL\n", k); continue; }
+                                uint32_t st = 0, lv = 0;
+                                int32_t cd = 0, cdm = 0, mx = 0;
+                                uint8_t ready = 0;
+                                bool okS = RdU32(e + 0x30, &st) && RdU32(e + 0x38, &lv)
+                                        && RdI32(e + 0x5C, &cd) && RdI32(e + 0x60, &cdm)
+                                        && RdI32(e + 0x64, &mx) && RdU8(e + 0x74, &ready);
+                                if (okS)
+                                    fprintf(fo, "      slot[%u] type=%u lvl=%u cd=%d cdmax=%d maxcd=%d ready=%u\n",
+                                            k, st, lv, cd, cdm, mx, (unsigned)ready);
+                                else
+                                    fprintf(fo, "      slot[%u] ERR\n", k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fflush(fo);
+    }
+    fprintf(fo, "# summary records=%d chain_fails=%d list_fails=%d\n", totalRec, chainFails, listFails);
+    fflush(fo);
+    fclose(fo);
+    if (totalRec == 0 || listFails >= 6) {
+        printf("[!] skilldump 无有效记录 (list_fails=%d, chain_fails=%d) — 可能不在对局或链路未就绪\n",
+               listFails, chainFails);
+        return 3;
+    }
+    printf("[OK] skilldump -> %s (%d records, chain_fails=%d)\n", outPath.c_str(), totalRec, chainFails);
+    return 0;
+}
+
 // ================= 用法 =================
-static void Usage() {
-    printf("best-king · 独立内存 dump 工具（Paradise 驱动专用, 硬闸门）\n");
+static void Usage() {    printf("best-king · 独立内存 dump 工具（Paradise 驱动专用, 硬闸门）\n");
     printf("用法: King.sh [--target pkg|pid] [--chunk N] <命令> ...\n");
     printf("  无参数                              自动模式: 闸门 + dumpgame 一键（MT直接运行用这个）\n");
     printf("  selftest                            驱动连接自检（闸门流程单跑）\n");
@@ -1227,6 +1435,7 @@ static void Usage() {
     printf("  wf     <hex址> <浮点>                驱动写 float +读回\n");
     printf("  scan   <out.bin> <hex址> <hex长> <类型> <下限> <上限>  值扫描 (i32/u32/f32/i16/u16/i8/u8)\n");
     printf("  sscan  <in.bin> <out.bin> <类型> <模式>              复扫收缩 (same/changed/dec/inc)\n");
+    printf("  skilldump <out.txt>                  单位列表(英雄/塔/兵/Buff)+技能槽 一键采样\n");
     printf("  bplive [dur_ms] [m]                  ★全自动: 开着打一局, 自动等到换局→新wrapper→live pos/hp+写入者\n");
     printf("默认目标: %s\n", kDefaultTarget);
     printf("示例: King.sh dumpgame /data/adb/JAY/game.bin /data/adb/JAY/game.idx\n");
@@ -1363,6 +1572,10 @@ int main(int argc, char** argv) {
     if (cmd == "sscan") {
         if (args.size() < 5) { Usage(); return 2; }
         return CmdSScan(args[1], args[2], args[3], args[4]);
+    }
+    if (cmd == "skilldump") {
+        if (args.size() < 2) { Usage(); return 2; }
+        return CmdSkillDump(args[1]);
     }
     if (cmd == "hwbp_selftest") return CmdHwbpSelfTest();
     Usage();
