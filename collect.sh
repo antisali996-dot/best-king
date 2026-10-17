@@ -5,8 +5,8 @@
 # 用法: sh /data/adb/JAY/collect.sh
 # 时间表（以"确认进入对局"为基准 T0, 约等于对局 0:10-0:45）:
 #   T0      等待进对局（King_snap 1帧轮询, 最长5分钟）
-#   T0+ 70s arena 时序列A  12帧×3s  (覆盖对局 ~2:00 施法窗)
-#   T0+195s arena 时序列B  12帧×3s  (覆盖对局 ~4:00 施法窗)
+#   T0+ 70s arena 时序列A  20帧×3s  (约70秒, 覆盖对局 ~2:00-2:30 施法窗)
+#   T0+195s arena 时序列B  20帧×3s  (约70秒, 覆盖对局 ~4:00-4:30 施法窗)
 #   T0+275s dumpgame 1               (对局 ~5:00, 兵线/野怪在场上)
 #   T0+615s dumpgame 2               (对局 ~10:40, 与dump1差分找对局时钟)
 # 产物: /data/adb/JAY/auto/<stamp>/  (collect.log + arenaA/B/*.bin + game1/2)
@@ -138,8 +138,8 @@ waittil() { # waittil <offset>
 
 # ---- 4) arena 时序列 A（对局 ~2:00 施法窗）----
 waittil 70
-say "[3] arena-A 时序列 12帧×3s  $(date '+%H:%M:%S')"
-sh /data/adb/JAY/King_shot.sh "$AL" "$OUT/arenaA" 12 3 >>"$LOG" 2>&1
+say "[3] arena-A 时序列 20帧×3s  $(date '+%H:%M:%S')"
+sh /data/adb/JAY/King_shot.sh "$AL" "$OUT/arenaA" 20 3 >>"$LOG" 2>&1
 SZA=$(wc -c < "$OUT/arenaA/f01_arena.bin" 2>/dev/null)
 if [ "$SZA" = "4194304" ] 2>/dev/null; then
     say "[3] arena-A 完成 $(date '+%H:%M:%S') (f01=4194304B OK)"
@@ -150,8 +150,8 @@ fi
 
 # ---- 5) arena 时序列 B（对局 ~4:00 施法窗）----
 waittil 195
-say "[4] arena-B 时序列 12帧×3s  $(date '+%H:%M:%S')"
-sh /data/adb/JAY/King_shot.sh "$AL" "$OUT/arenaB" 12 3 >>"$LOG" 2>&1
+say "[4] arena-B 时序列 20帧×3s  $(date '+%H:%M:%S')"
+sh /data/adb/JAY/King_shot.sh "$AL" "$OUT/arenaB" 20 3 >>"$LOG" 2>&1
 SZB=$(wc -c < "$OUT/arenaB/f01_arena.bin" 2>/dev/null)
 if [ "$SZB" = "4194304" ] 2>/dev/null; then
     say "[4] arena-B 完成 $(date '+%H:%M:%S') (f01=4194304B OK)"
