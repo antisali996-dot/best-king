@@ -1058,6 +1058,153 @@ static int CmdWf(const std::string& addrS, const std::string& valS) {
     return CmdWriteVerify("wf", addr, &f, 4);
 }
 
+// ---- 值扫描族 (scan/sscan): 多轮收缩定位字段 ----
+static const uint32_t SCAN_MAX_CAND = 1u << 20;   // 1M 条候选 = 16MB 输出上限
+static const uint32_t SCAN_MAGIC = 0x31534B42u;   // "BKS1"
+
+struct ScanCand { uint64_t addr, raw; };
+
+static int ScanTypeSize(const std::string& t) {
+    if (t == "i32" || t == "u32" || t == "f32") return 4;
+    if (t == "i16" || t == "u16") return 2;
+    if (t == "i8" || t == "u8") return 1;
+    return 0;
+}
+
+static void ScanWriteFile(const std::string& outS, int ts, const std::vector<ScanCand>& cands) {
+    FILE* fp = fopen(outS.c_str(), "wb");
+    if (!fp) { printf("[X] 无法写: %s\n", outS.c_str()); return; }
+    uint32_t magic = SCAN_MAGIC, tcode = (uint32_t)ts;
+    uint64_t cnt = cands.size();
+    fwrite(&magic, 4, 1, fp);
+    fwrite(&tcode, 4, 1, fp);
+    fwrite(&cnt, 8, 1, fp);
+    for (size_t i = 0; i < cands.size(); ++i) {
+        fwrite(&cands[i].addr, 8, 1, fp);
+        fwrite(&cands[i].raw, 8, 1, fp);
+    }
+    fclose(fp);
+}
+
+static int CmdScan(const std::string& outS, uint64_t start, uint64_t len,
+                   const std::string& type, const std::string& v1s, const std::string& v2s) {
+    const int ts = ScanTypeSize(type);
+    if (!ts) { printf("[!] 类型: i32/u32/f32/i16/u16/i8/u8\n"); return 2; }
+    if (len == 0) { printf("[!] 长度 0\n"); return 2; }
+    char* e1 = nullptr; char* e2 = nullptr;
+    double d1 = strtod(v1s.c_str(), &e1);
+    double d2 = strtod(v2s.c_str(), &e2);
+    if (!e1 || e1 == v1s.c_str() || !e2 || e2 == v2s.c_str()) { printf("[!] 值解析失败\n"); return 2; }
+    if (d1 > d2) { double t = d1; d1 = d2; d2 = t; }
+    int64_t i1 = (int64_t)d1, i2 = (int64_t)d2;
+    uint64_t u1 = (d1 < 0) ? 0 : (uint64_t)d1;
+    uint64_t u2 = (d2 < 0) ? 0 : (uint64_t)d2;
+    float f1 = (float)d1, f2 = (float)d2;
+
+    std::vector<ScanCand> cands;
+    std::vector<uint8_t> buf((size_t)std::min<uint64_t>(len, 65536));
+    uint64_t off = 0, failBytes = 0;
+    while (off < len) {
+        size_t want = (size_t)std::min<uint64_t>((uint64_t)buf.size(), len - off);
+        if (!DrvReadAt(start + off, buf.data(), want)) {
+            failBytes += want;
+            off += want;
+            continue;
+        }
+        for (size_t p = 0; p + (size_t)ts <= want; p += (size_t)ts) {
+            uint64_t raw = 0;
+            memcpy(&raw, buf.data() + p, (size_t)ts);
+            bool hit = false;
+            if (type == "f32") {
+                float f; uint32_t r = (uint32_t)raw; memcpy(&f, &r, 4);
+                hit = (f == f) && f >= f1 && f <= f2;
+            } else if (type == "i32") { int32_t s = (int32_t)(uint32_t)raw; hit = (int64_t)s >= i1 && (int64_t)s <= i2; }
+            else if (type == "u32") { uint32_t u = (uint32_t)raw; hit = (uint64_t)u >= u1 && (uint64_t)u <= u2; }
+            else if (type == "i16") { int16_t s = (int16_t)(uint16_t)raw; hit = (int64_t)s >= i1 && (int64_t)s <= i2; }
+            else if (type == "u16") { uint16_t u = (uint16_t)raw; hit = (uint64_t)u >= u1 && (uint64_t)u <= u2; }
+            else if (type == "i8") { int8_t s = (int8_t)(uint8_t)raw; hit = (int64_t)s >= i1 && (int64_t)s <= i2; }
+            else if (type == "u8") { uint8_t u = (uint8_t)raw; hit = (uint64_t)u >= u1 && (uint64_t)u <= u2; }
+            if (hit) {
+                if (cands.size() >= SCAN_MAX_CAND) {
+                    printf("[!] 候选超过上限 %u, 请缩小区域或值域\n", (unsigned)SCAN_MAX_CAND);
+                    return 1;
+                }
+                ScanCand c; c.addr = start + off + p; c.raw = raw;
+                cands.push_back(c);
+            }
+        }
+        off += want;
+    }
+    ScanWriteFile(outS, ts, cands);
+    printf("[OK] scan %s [%#llx,+%#llx] => %zu 候选 -> %s (读失败 %#llx 字节)\n",
+           type.c_str(), (unsigned long long)start, (unsigned long long)len,
+           cands.size(), outS.c_str(), (unsigned long long)failBytes);
+    return 0;
+}
+
+static int CmdSScan(const std::string& inS, const std::string& outS,
+                    const std::string& type, const std::string& mode) {
+    const int ts = ScanTypeSize(type);
+    if (!ts) { printf("[!] 类型: i32/u32/f32/i16/u16/i8/u8\n"); return 2; }
+    if (mode != "same" && mode != "changed" && mode != "dec" && mode != "inc") {
+        printf("[!] 模式: same/changed/dec/inc\n"); return 2;
+    }
+    FILE* fp = fopen(inS.c_str(), "rb");
+    if (!fp) { printf("[X] 无法读: %s\n", inS.c_str()); return 1; }
+    uint32_t magic = 0, tcode = 0; uint64_t cnt = 0;
+    if (fread(&magic, 4, 1, fp) != 1 || fread(&tcode, 4, 1, fp) != 1 || fread(&cnt, 8, 1, fp) != 1 ||
+        magic != SCAN_MAGIC || (int)tcode != ts) {
+        printf("[X] 文件格式不符或类型不一致\n"); fclose(fp); return 1;
+    }
+    if (cnt > SCAN_MAX_CAND) { printf("[X] 记录数超上限, 文件异常\n"); fclose(fp); return 1; }
+    std::vector<ScanCand> keep;
+    uint64_t readFails = 0;
+    for (uint64_t i = 0; i < cnt; ++i) {
+        ScanCand c;
+        if (fread(&c.addr, 8, 1, fp) != 1 || fread(&c.raw, 8, 1, fp) != 1) break;
+        uint64_t cur = 0;
+        if (!DrvReadAt(c.addr, &cur, (size_t)ts)) { readFails++; continue; }
+        bool ok = false;
+        if (type == "f32") {
+            float fo, fn; uint32_t ro = (uint32_t)c.raw, rn = (uint32_t)cur;
+            memcpy(&fo, &ro, 4); memcpy(&fn, &rn, 4);
+            if (mode == "same") ok = (ro == rn);
+            else if (mode == "changed") ok = (ro != rn);
+            else if (mode == "dec") ok = (fn < fo);
+            else ok = (fn > fo);
+        } else {
+            bool isNeg = (type == "i32" || type == "i16" || type == "i8");
+            bool same = (c.raw == cur);
+
+            auto asI = [&](uint64_t v) -> int64_t {
+                if (type == "i32") return (int64_t)(int32_t)(uint32_t)v;
+                if (type == "i16") return (int64_t)(int16_t)(uint16_t)v;
+                if (type == "i8") return (int64_t)(int8_t)(uint8_t)v;
+                if (ts == 4) return (int64_t)(uint32_t)v;
+                if (ts == 2) return (int64_t)(uint16_t)v;
+                return (int64_t)(uint8_t)v;
+            };
+            if (mode == "same") ok = same;
+            else if (mode == "changed") ok = !same;
+            else {
+                int64_t a = asI(c.raw), b = asI(cur);
+                if (isNeg) ok = (mode == "dec") ? (b < a) : (b > a);
+                else {
+                    uint64_t ua = (uint64_t)a, ub = (uint64_t)b;
+                    ok = (mode == "dec") ? (ub < ua) : (ub > ua);
+                }
+            }
+        }
+        if (ok) keep.push_back({c.addr, cur});
+    }
+    fclose(fp);
+    ScanWriteFile(outS, ts, keep);
+    printf("[OK] sscan %s %s: %llu -> %zu (读失败 %llu) -> %s\n",
+           type.c_str(), mode.c_str(), (unsigned long long)cnt, keep.size(),
+           (unsigned long long)readFails, outS.c_str());
+    return 0;
+}
+
 // ================= 用法 =================
 static void Usage() {
     printf("best-king · 独立内存 dump 工具（Paradise 驱动专用, 硬闸门）\n");
@@ -1078,6 +1225,8 @@ static void Usage() {
     printf("  w32    <hex址> <值>                  驱动写 u32 (值支持 0x/十进制)+读回\n");
     printf("  w64    <hex址> <值>                  驱动写 u64 +读回\n");
     printf("  wf     <hex址> <浮点>                驱动写 float +读回\n");
+    printf("  scan   <out.bin> <hex址> <hex长> <类型> <下限> <上限>  值扫描 (i32/u32/f32/i16/u16/i8/u8)\n");
+    printf("  sscan  <in.bin> <out.bin> <类型> <模式>              复扫收缩 (same/changed/dec/inc)\n");
     printf("  bplive [dur_ms] [m]                  ★全自动: 开着打一局, 自动等到换局→新wrapper→live pos/hp+写入者\n");
     printf("默认目标: %s\n", kDefaultTarget);
     printf("示例: King.sh dumpgame /data/adb/JAY/game.bin /data/adb/JAY/game.idx\n");
@@ -1205,6 +1354,15 @@ int main(int argc, char** argv) {
     if (cmd == "wf") {
         if (args.size() < 3) { Usage(); return 2; }
         return CmdWf(args[1], args[2]);
+    }
+    if (cmd == "scan") {
+        if (args.size() < 7) { Usage(); return 2; }
+        return CmdScan(args[1], strtoull(args[2].c_str(), nullptr, 16),
+                       strtoull(args[3].c_str(), nullptr, 16), args[4], args[5], args[6]);
+    }
+    if (cmd == "sscan") {
+        if (args.size() < 5) { Usage(); return 2; }
+        return CmdSScan(args[1], args[2], args[3], args[4]);
     }
     if (cmd == "hwbp_selftest") return CmdHwbpSelfTest();
     Usage();
