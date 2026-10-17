@@ -100,7 +100,11 @@ inrg() { # inrg <dec> <decLo> <decHi>  -> 0/1
 run_raw() {   # run_raw <stdoutfile> <args...>
     O=$1; shift
     if [ "$IS_ELF" = 1 ]; then
-        "$K" "$@" </dev/null >"$O" 2>/dev/null
+        if [ -x /system/bin/linker64 ]; then
+            /system/bin/linker64 "$K" "$@" </dev/null >"$O" 2>/dev/null
+        else
+            "$K" "$@" </dev/null >"$O" 2>/dev/null
+        fi
     else
         sh "$K" "$@" </dev/null >"$O" 2>/dev/null
     fi

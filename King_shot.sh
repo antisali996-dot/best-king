@@ -72,7 +72,11 @@ echo "=================================================="
 
 run_range() {
     if [ "$IS_ELF" = 1 ]; then
-        "$K" range "$1" "$2" "$3" </dev/null >/dev/null 2>&1
+        if [ -x /system/bin/linker64 ]; then
+            /system/bin/linker64 "$K" range "$1" "$2" "$3" </dev/null >/dev/null 2>&1
+        else
+            "$K" range "$1" "$2" "$3" </dev/null >/dev/null 2>&1
+        fi
     else
         sh "$K" range "$1" "$2" "$3" </dev/null >/dev/null 2>&1
     fi
